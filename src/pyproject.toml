@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "cka_mock"
+version = "0.1.0"
+description = "LLM-generated CKA mock exams on Minikube"
+authors = ["cka_mock <dev@example.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+rich = "^13.0"
+openai = "^1.0.0"
+PyYAML = "^6.0"
+jsonschema = "^4.0"
+
+[tool.poetry.dev-dependencies]
+pytest = "^7.0"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+cka-mock = "cka_mock.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
