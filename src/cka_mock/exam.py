@@ -208,10 +208,10 @@ def _run_exam_flow(cfg, plan, results, workdir, exam_dir, *, raw, provider=None)
             f"Q{', Q'.join(str(i + 1) for i in repaired)}"
         )
     console.print()
-    console.print("  Solve the questions in your terminal, e.g.:")
-    console.print(f"    export KUBECONFIG={exam_dir / 'kubeconfig'}")
-    console.print(f"    cat {exam_dir / 'questions.md'}")
-    console.print(f"    ls {exam_dir / 'files'}   # provided files for file-based challenges")
+    console.print("  Solve the questions in your terminal (copy-paste):")
+    console.print(f"    pushd {exam_dir}; export KUBECONFIG=$PWD/kubeconfig")
+    console.print("    cat questions.md")
+    console.print("    ls files   # provided files for file-based challenges")
     console.print("  When done, grade with:  cka-mock grade")
     return 0
 

@@ -29,10 +29,12 @@
           pkgs.minikube
           pkgs.kubernetes-helm
           pkgs.kustomize
+          (pkgs.writeShellScriptBin "k" "exec ${pkgs.kubernetes}/bin/kubectl \"\$@\"")
         ];
 
         shellHook = ''
           echo "NIX Dev Environment - cka-mock"
+          alias k='kubectl'
         '';
       };
 
