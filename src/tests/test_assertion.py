@@ -34,6 +34,19 @@ def test_jsonpath_dict_eq():
     assert a.evaluate(_completed(0, stdout='{"app":"other"}')).passed is False
 
 
+def test_superset_dict_checks_pod_labels():
+    # The Deployment labels requirement targets the pod template labels. Missing
+    # a required label must fail; extra labels must pass.
+    a = ResourceAssertion(
+        "deployments.apps", "web-front", "ns", "{.spec.template.metadata.labels}",
+        {"app": "web-front", "tier": "frontend"}, "superset",
+    )
+    assert a.evaluate(_completed(0, stdout='{"app":"web-front","tier":"frontend"}')).passed is True
+    assert a.evaluate(_completed(0, stdout='{"app":"web-front","tier":"frontend","extra":"x"}')).passed is True
+    assert a.evaluate(_completed(0, stdout='{"app":"web-front"}')).passed is False
+    assert a.evaluate(_completed(0, stdout='{"tier":"frontend"}')).passed is False
+
+
 def test_jsonpath_gte():
     a = ResourceAssertion("deployments.apps", "web", "ns", "{.status.availableReplicas}", 3, "gte")
     assert a.evaluate(_completed(0, stdout="4")).passed is True

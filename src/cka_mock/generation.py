@@ -24,6 +24,7 @@ def build_generation_prompt(
     num_questions: int,
     difficulty: str,
     fingerprints: list[str] | None = None,
+    rejected: list[dict] | None = None,
 ) -> str:
     lines = [
         "You generate mock CKA exam challenges as JSON.",
@@ -44,6 +45,15 @@ def build_generation_prompt(
         lines.append(f"- {arch.id}: {arch.title} [{arch.domain}] topics={', '.join(arch.topics)}")
         lines.append(f"    {arch.description}")
         lines.append(f"    params: {summarize_schema(arch.params_schema)}")
+    if rejected:
+        lines.append("")
+        lines.append(
+            "These previously-attempted questions were REJECTED (their setups/preflights "
+            "failed). Do NOT recreate them or near-variants. Replace them with different "
+            "archetypes and different names/namespaces/params:"
+        )
+        for question in rejected:
+            lines.append(f"- {question.get('archetype')} {json.dumps(question.get('params', {}), sort_keys=True)}")
     if fingerprints:
         lines.append("")
         lines.append(
@@ -54,7 +64,9 @@ def build_generation_prompt(
     lines.append("")
     lines.append(
         "Constraints: names/namespaces must match ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$; images only "
-        "from the allowed list; ports in 1..65535. Use realistic, varied names and namespaces."
+        "from the allowed list; ports in 1..65535; ConfigMap/Secret data keys must be valid "
+        "environment-variable names (^[A-Za-z_][A-Za-z0-9_]*$). Use realistic, varied names "
+        "and namespaces."
     )
     return "\n".join(lines)
 
@@ -79,18 +91,22 @@ def generate_exam_plan(
     num_questions: int = 17,
     difficulty: str = "medium",
     fingerprints: list[str] | None = None,
+    rejected: list[dict] | None = None,
     max_retries: int = 3,
 ) -> tuple[ExamPlan, str]:
     """Ask the provider for an exam plan, validating with fail-closed retries.
 
-    Returns ``(plan, raw_output)`` so the raw LLM output is auditable.
-    Raises :class:`GenerationError` if validation never passes.
+    ``rejected`` lists question dicts (archetype + params) from failed attempts
+    that must not be recreated. Returns ``(plan, raw_output)`` so the raw LLM
+    output is auditable. Raises :class:`GenerationError` if validation never
+    passes.
     """
     prompt = build_generation_prompt(
         topics=topics,
         num_questions=num_questions,
         difficulty=difficulty,
         fingerprints=fingerprints,
+        rejected=rejected,
     )
     errors: list[str] = []
     raw_output = ""

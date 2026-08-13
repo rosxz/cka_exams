@@ -223,6 +223,30 @@ def test_image_allowlist_is_curated():
     assert IMAGE_ALLOWLIST
 
 
+def test_cm_secret_keys_must_be_valid_env_names():
+    base = {
+        "archetype": "configmap_secret",
+        "params": {
+            "name": "cfg",
+            "namespace": "app",
+            "deploy_name": "app",
+            "image": "nginx:1.27",
+            "replicas": 1,
+            "labels": {"app": "app"},
+        },
+    }
+    bad_key = {**base, "params": {**base["params"], "cm_data": {"bad.key": "v"}}}
+    errors = validate_exam_payload({"questions": [bad_key]}, REGISTRY)
+    assert any("bad.key" in e for e in errors)
+
+    bad_start = {**base, "params": {**base["params"], "secret_data": {"1start": "v"}}}
+    errors = validate_exam_payload({"questions": [bad_start]}, REGISTRY)
+    assert any("1start" in e for e in errors)
+
+    good = {**base, "params": {**base["params"], "cm_data": {"FOO_1": "v"}, "secret_data": {"bar": "v"}}}
+    assert validate_exam_payload({"questions": [good]}, REGISTRY) == []
+
+
 def test_parse_json_strips_fences():
     assert parse_json('```json\n{"a": 1}\n```') == {"a": 1}
     assert parse_json('{"a": 1}') == {"a": 1}

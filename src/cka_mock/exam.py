@@ -43,19 +43,76 @@ def run_new(cfg: Config, *, topics_override, questions_override, difficulty_over
     difficulty = difficulty_override if difficulty_override is not None else cfg.difficulty
 
     provider = _build_provider(cfg)
-    plan, raw = generate_exam_plan(
-        provider,
-        topics=topics,
-        num_questions=questions,
-        difficulty=difficulty,
-        fingerprints=load_fingerprints(cfg.workdir_root),
-    )
-    add_fingerprints(cfg.workdir_root, [q.params | {"archetype": q.archetype_id} for q in plan.questions])
+    workdir = Workdir(cfg.workdir_root)
+    attempts = max(1, cfg.exam_attempts)
+    rejected: list[dict] = []
+    last_error: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            console.print(
+                f"[yellow]Regenerating exam (attempt {attempt}/{attempts}) with a different "
+                f"challenge set ...[/yellow]"
+            )
+        plan, raw = generate_exam_plan(
+            provider,
+            topics=topics,
+            num_questions=questions,
+            difficulty=difficulty,
+            fingerprints=load_fingerprints(cfg.workdir_root),
+            rejected=rejected or None,
+        )
+        add_fingerprints(
+            cfg.workdir_root, [q.params | {"archetype": q.archetype_id} for q in plan.questions]
+        )
+        results = render_exam(plan)
+        exam_dir = workdir.new_exam()
+        try:
+            return _run_exam_flow(cfg, plan, results, workdir, exam_dir, raw=raw)
+        except KeyboardInterrupt:
+            _cleanup_failed_exam(exam_dir)
+            raise
+        except Exception as exc:  # noqa: BLE001 - reported, then retried
+            _cleanup_failed_exam(exam_dir)
+            last_error = exc
+            console.print(
+                f"[yellow]Exam attempt {attempt} failed: {exc}[/yellow]"
+            )
+            rejected.extend(
+                {"archetype": q.archetype_id, "params": q.params} for q in plan.questions
+            )
+
+    assert last_error is not None
+    raise last_error
+
+
+def run_replay(cfg: Config, exam_id: str) -> int:
+    """Repeat a past exam as a fresh attempt: same questions, reset cluster,
+    full setup + preflight. Deterministic — no LLM involved."""
+    workdir = Workdir(cfg.workdir_root)
+    source_dir = workdir.find(exam_id)
+    plan_payload = workdir.load_plan(source_dir)
+    plan = _plan_from_payload(plan_payload)
     results = render_exam(plan)
 
-    workdir = Workdir(cfg.workdir_root)
     exam_dir = workdir.new_exam()
+    console.print(
+        f"[bold]Repeating exam {exam_id}[/bold] ({len(results)} questions) as a fresh attempt ..."
+    )
+    try:
+        return _run_exam_flow(cfg, plan, results, workdir, exam_dir, raw=None)
+    except BaseException:
+        _cleanup_failed_exam(exam_dir)
+        raise
 
+
+def _cleanup_failed_exam(exam_dir: Path) -> None:
+    # An interrupted or failed `new`/`replay` should not leave a half-baked exam dir.
+    if not (exam_dir / "exam.json").is_file():
+        shutil.rmtree(exam_dir, ignore_errors=True)
+
+
+def _run_exam_flow(cfg, plan, results, workdir, exam_dir, *, raw) -> int:
     env = MinikubeEnv(
         profile=cfg.minikube_profile,
         cpus=cfg.minikube_cpus,
@@ -63,8 +120,8 @@ def run_new(cfg: Config, *, topics_override, questions_override, difficulty_over
         cni=cfg.minikube_cni,
         addons=tuple(cfg.addons),
     )
-    console.print(f"[bold]Resetting minikube profile[/bold] {cfg.minikube_profile} ...")
-    env.start(reset=True)
+    console.print(f"[bold]Preparing minikube profile[/bold] {cfg.minikube_profile} ...")
+    env.start(reset=True, log=lambda msg: console.print(msg))
 
     kubeconfig = env.export_kubeconfig(exam_dir / "kubeconfig")
     kubectl = env.kubectl(kubeconfig)
@@ -72,7 +129,8 @@ def run_new(cfg: Config, *, topics_override, questions_override, difficulty_over
 
     workdir.save_plan(exam_dir, plan)
     workdir.write(exam_dir, "questions.md", render_task_markdown(results))
-    workdir.write(exam_dir, "generation.json", raw)
+    if raw is not None:
+        workdir.write(exam_dir, "generation.json", raw)
     _write_exam_files(exam_dir, results)
 
     if any(r.archetype_id == "helm" for r in results) and not shutil.which("helm"):
@@ -185,25 +243,6 @@ def run_list(cfg: Config, json_output: bool = False) -> int:
     else:
         for entry in entries:
             console.print(f"{entry['exam_id']}  {entry['questions']}q  {', '.join(entry['archetypes'])}")
-    return 0
-
-
-def run_replay(cfg: Config, exam_id: str) -> int:
-    workdir = Workdir(cfg.workdir_root)
-    exam_dir = workdir.find(exam_id)
-    plan_payload = workdir.load_plan(exam_dir)
-    plan = _plan_from_payload(plan_payload)
-    results = render_exam(plan)
-    env = MinikubeEnv(profile=cfg.minikube_profile)
-    if not env.status().get("running"):
-        raise RuntimeError(
-            f"exam cluster '{cfg.minikube_profile}' is not running. Run `cka-mock new` first."
-        )
-    kubectl = env.kubectl(exam_dir / "kubeconfig")
-    grade = grade_exam(results, kubectl.run)
-    report = render_text_report(grade)
-    workdir.write(exam_dir, "report.txt", report)
-    console.print(report)
     return 0
 
 

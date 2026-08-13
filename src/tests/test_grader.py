@@ -39,7 +39,7 @@ def test_grade_full_pass(fake_tooling):
     fake_tooling.when("kubectl", "get", "deployments.apps")(_deploy_handler("web", "frontend", {
         ".spec.replicas": "3",
         ".spec.template.spec.containers[0].image": "nginx:1.27",
-        ".spec.selector.matchLabels": '{"app":"web"}',
+        ".spec.template.metadata.labels": '{"app":"web"}',
         ".status.availableReplicas": "3",
     }))
     kubectl = Kubectl()
@@ -56,7 +56,7 @@ def test_grade_partial_credit(fake_tooling):
     fake_tooling.when("kubectl", "get", "deployments.apps")(_deploy_handler("web", "frontend", {
         ".spec.replicas": "3",
         ".spec.template.spec.containers[0].image": "wrong-image",
-        ".spec.selector.matchLabels": '{"app":"web"}',
+        ".spec.template.metadata.labels": '{"app":"web"}',
         ".status.availableReplicas": "3",
     }))
     kubectl = Kubectl()
@@ -73,7 +73,7 @@ def test_grade_multi_question(fake_tooling):
         return _deploy_handler(name, namespace, {
             ".spec.replicas": "2",
             ".spec.template.spec.containers[0].image": "redis:7.2",
-            ".spec.selector.matchLabels": '{"app":"web"}',
+            ".spec.template.metadata.labels": '{"app":"web"}',
             ".status.availableReplicas": "2",
         })
 

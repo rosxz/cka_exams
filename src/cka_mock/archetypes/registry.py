@@ -241,8 +241,15 @@ def _simple_key_schema() -> dict:
     return {"type": "string", "pattern": r"^[A-Za-z0-9_-]+$", "minLength": 1}
 
 
-def _string_map_schema() -> dict:
-    return {"type": "object", "additionalProperties": {"type": "string"}}
+def _env_map_schema() -> dict:
+    # Keys feed `envFrom` on the reference deployment, so they must be valid
+    # environment-variable names or the pod fails to start.
+    return {
+        "type": "object",
+        "maxProperties": 10,
+        "propertyNames": {"pattern": r"^[A-Za-z_][A-Za-z0-9_]*$"},
+        "additionalProperties": {"type": "string"},
+    }
 
 
 _register(Archetype(
@@ -261,8 +268,8 @@ _register(Archetype(
         "properties": {
             "name": name_schema(),
             "namespace": name_schema(),
-            "cm_data": _string_map_schema(),
-            "secret_data": _string_map_schema(),
+            "cm_data": _env_map_schema(),
+            "secret_data": _env_map_schema(),
             "deploy_name": name_schema(),
             "image": image_schema(),
             "replicas": {"type": "integer", "minimum": 1, "maximum": 10},

@@ -29,9 +29,10 @@ class Config:
     minikube_cni: str | None = "calico"
     questions: int = 17
     duration_minutes: int = 120
+    exam_attempts: int = 3
     workdir_root: Path = field(default_factory=default_workdir_root)
     topics: list[str] = field(default_factory=list)
-    addons: list[str] = field(default_factory=lambda: ["ingress", "metrics-server"])
+    addons: list[str] = field(default_factory=lambda: ["metrics-server"])
     difficulty: str = "medium"
 
     @property
@@ -57,6 +58,7 @@ def _coerce(key: str, value):
         "minikube_cni",
         "questions",
         "duration_minutes",
+        "exam_attempts",
     ):
         return value if key == "minikube_cni" else int(value)
     return value

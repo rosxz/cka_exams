@@ -42,6 +42,17 @@ def _compare(op: str, stdout: str, expect: Any, label: str) -> AssertionResult:
         passed = bool(stdout)
         return AssertionResult(passed, f"{label} is non-empty", actual=stdout)
     if op == "superset":
+        if isinstance(expect, dict):
+            try:
+                actual_dict = json.loads(stdout)
+                passed = isinstance(actual_dict, dict) and expect.items() <= actual_dict.items()
+                actual = actual_dict if isinstance(actual_dict, dict) else stdout
+            except json.JSONDecodeError:
+                passed = False
+                actual = stdout
+            return AssertionResult(
+                passed, f"{label} covers all of {sorted(expect)}", actual=actual
+            )
         wanted = {str(x) for x in expect}
         passed = wanted <= set(_tokens(stdout))
         return AssertionResult(passed, f"{label} covers all of {sorted(wanted)}", actual=_tokens(stdout))

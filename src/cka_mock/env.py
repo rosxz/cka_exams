@@ -11,6 +11,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from .kubectl import Kubectl
 
@@ -42,8 +43,15 @@ class MinikubeEnv:
     def kubectl(self, kubeconfig: Path | None = None) -> Kubectl:
         return Kubectl(context=self.profile, kubeconfig=kubeconfig)
 
-    def start(self, *, reset: bool = True, wait_timeout: int = 600) -> None:
+    def start(
+        self,
+        *,
+        reset: bool = True,
+        wait_timeout: int = 600,
+        log: Callable[[str], None] = print,
+    ) -> None:
         if reset:
+            log("  deleting previous profile (if any) ...")
             self.delete()
         cmd = self._base() + ["start"]
         if self.driver:
@@ -56,16 +64,38 @@ class MinikubeEnv:
             # The default minikube CNI does not enforce NetworkPolicies; use a
             # policy-capable CNI so NetworkPolicy challenges are verifiable.
             cmd += ["--network-plugin=cni", f"--cni={self.cni}"]
+        log(
+            f"  starting cluster (profile {self.profile}, driver={self.driver or 'auto'}, "
+            f"cni={self.cni or 'default'}) ..."
+        )
+        log("    the first start downloads the base image and CNI images; this can take several minutes")
+        started = time.monotonic()
         proc = _run(cmd, timeout=900)
         if proc.returncode != 0:
             raise MinikubeError(f"minikube start failed: {proc.stderr.strip()}")
+        log(f"  cluster started in {time.monotonic() - started:.0f}s; waiting for node Ready ...")
         self._wait_nodes_ready(wait_timeout)
+        self._enable_addons(log)
+
+    def _enable_addons(self, log: Callable[[str], None]) -> None:
+        if "ingress" in self.addons:
+            # minikube's ingress addon controller only schedules on nodes labeled
+            # `ingress-ready=true`; label them before enabling, otherwise the
+            # controller pods stay Pending and `addons enable` blocks.
+            log("  labeling node for ingress addon ...")
+            _run(
+                ["kubectl", "--context", self.profile, "label", "nodes", "--all",
+                 "ingress-ready=true", "--overwrite"],
+                timeout=60,
+            )
         for addon in self.addons:
-            addon_proc = _run(self._base() + ["addons", "enable", addon], timeout=300)
+            log(f"  enabling addon {addon} ...")
+            addon_proc = _run(self._base() + ["addons", "enable", addon], timeout=120)
             if addon_proc.returncode != 0 and "already enabled" not in addon_proc.stderr:
                 raise MinikubeError(
                     f"failed to enable addon {addon}: {addon_proc.stderr.strip()}"
                 )
+        log("  cluster ready")
 
     def _wait_nodes_ready(self, timeout: int) -> None:
         deadline = time.monotonic() + timeout

@@ -16,7 +16,8 @@ def test_defaults(tmp_path, monkeypatch):
     assert cfg.questions == 17
     assert cfg.duration_minutes == 120
     assert cfg.topics == []
-    assert "ingress" in cfg.addons
+    assert "metrics-server" in cfg.addons
+    assert "ingress" not in cfg.addons
 
 
 def test_load_from_file(tmp_path, monkeypatch):

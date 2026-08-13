@@ -22,7 +22,9 @@ cka-mock new  [--topics RBAC Helm ...] [--questions N] [--duration M] [--difficu
 cka-mock grade
 cka-mock status
 cka-mock reset
-cka-mock replay <exam-id>
+cka-mock replay <exam-id>     # repeat a past exam as a fresh attempt (no LLM):
+                              #   resets the cluster, re-applies the broken states,
+                              #   serves the same questions again
 cka-mock list  [--json]
 ```
 
@@ -68,6 +70,12 @@ Planned:
 
 - NetworkPolicy challenges require a policy-enforcing CNI; the env defaults to Calico
   (`minikube_cni = "calico"` in config).
+- Default addons are `metrics-server` only. The `ingress` addon is slow and, unlabeled,
+  leaves controller pods Pending — if you opt in via config, the tool auto-labels the
+  node `ingress-ready=true` first.
+- If any question fails preflight (reference not satisfiable, e.g. an unschedulable
+  setup), `cka-mock new` retries up to `exam_attempts` (default 3) times: it regenerates
+  a different challenge set and marks the failed questions as rejected in the next prompt.
 - `cka-mock new` needs an OpenCode key (`OPENCODE_API_KEY`). Use `scripts/e2e.py` for an
   offline full-loop test (no LLM).
 - Set `CKA_MOCK_DEBUG=1` for verbose preflight polling.

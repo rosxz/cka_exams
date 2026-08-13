@@ -136,8 +136,8 @@ def render_deployment(q: QuestionSpec) -> RenderResult:
     labels = p["labels"]
     task = (
         f"Create a Deployment named `{p['name']}` in namespace `{p['namespace']}` "
-        f"running image `{p['image']}` with {p['replicas']} replica(s) and the labels "
-        f"{_labels_repr(labels)}."
+        f"running image `{p['image']}` with {p['replicas']} replica(s). The pods must carry the "
+        f"labels {_labels_repr(labels)}."
     )
     if p.get("container_port"):
         task += f" The container should expose port {p['container_port']}."
@@ -160,7 +160,7 @@ def render_deployment(q: QuestionSpec) -> RenderResult:
         ),
         ResourceAssertion(
             "deployments.apps", p["name"], p["namespace"],
-            "{.spec.selector.matchLabels}", labels, "eq",
+            "{.spec.template.metadata.labels}", labels, "superset",
         ),
         ResourceAssertion(
             "deployments.apps", p["name"], p["namespace"],

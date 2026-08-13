@@ -36,4 +36,8 @@ buildPythonApplication rec {
   pythonImportsCheck = [
     "cka_mock"
   ];
+
+  meta = {
+    mainProgram = "cka-mock";
+  };
 }

@@ -30,7 +30,7 @@ def _scripted_environment(fake_tooling, *, deployed: bool, image: str = "nginx:1
     jsonpath_values = {
         ".spec.replicas": "3",
         ".spec.template.spec.containers[0].image": image,
-        ".spec.selector.matchLabels": '{"app":"web"}',
+        ".spec.template.metadata.labels": '{"app":"web"}',
         ".status.availableReplicas": "3",
     }
 

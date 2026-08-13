@@ -96,3 +96,18 @@ def test_prompt_mentions_topics_and_constraints(capsys=None):
     assert "difficulty" in prompt.lower()
     assert "^[a-z0-9]" in prompt
     assert "x" in prompt  # fingerprint surfaced
+
+
+def test_prompt_lists_rejected_questions():
+    from cka_mock.generation import build_generation_prompt
+
+    prompt = build_generation_prompt(
+        topics=[],
+        num_questions=2,
+        difficulty="medium",
+        rejected=[{"archetype": "configmap_secret", "params": {"name": "cfg", "namespace": "app"}}],
+    )
+    assert "REJECTED" in prompt
+    assert "configmap_secret" in prompt
+    assert "cfg" in prompt
+    assert "Do NOT recreate" in prompt
