@@ -879,6 +879,199 @@ def render_kustomize(q: QuestionSpec) -> RenderResult:
     return r
 
 
+_INGRESS_CONTROLLER_SVC = "ingress-nginx-controller.ingress-nginx.svc"
+
+
+def _ingress_probe_cmd(host: str, path: str = "/") -> str:
+    return (
+        f"wget -qO- -T 10 --header='Host: {host}' "
+        f"http://{_INGRESS_CONTROLLER_SVC}{path or '/'}"
+    )
+
+
+def _marker_backend(name, namespace, labels, marker, *, port, image, replicas) -> list[dict]:
+    cm_name = f"{name}-html"
+    deploy_name = name
+    svc_name = f"{name}-svc"
+    return [
+        {
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": cm_name, "namespace": namespace},
+            "data": {"index.html": marker},
+        },
+        _deployment_doc(
+            deploy_name, namespace, image, replicas, labels,
+            container_port=80,
+            volume_mounts=[{"name": "html", "mountPath": "/usr/share/nginx/html"}],
+            volumes=[{"name": "html", "configMap": {"name": cm_name}}],
+        ),
+        _service_doc(svc_name, namespace, "ClusterIP", port, 80, labels),
+    ]
+
+
+def _ingress_rule(host: str, svc_name: str, port: int) -> dict:
+    return {
+        "host": host,
+        "http": {
+            "paths": [
+                {
+                    "path": "/",
+                    "pathType": "Prefix",
+                    "backend": {"service": {"name": svc_name, "port": {"number": port}}},
+                }
+            ]
+        },
+    }
+
+
+def render_ingress(q: QuestionSpec) -> RenderResult:
+    p = q.params
+    namespace = p["namespace"]
+    name = p["name"]
+    host = p["host"]
+    port = p.get("port", 80)
+    ingress_class = p.get("ingress_class", "nginx")
+    # The marker is served via a ConfigMap mounted at nginx's html root, so the
+    # backend image is fixed to nginx.
+    backend_image = "nginx:1.27"
+    replicas = p.get("replicas", 1)
+    labels = p["labels"]
+    svc_name = f"{name}-backend-svc"
+    deploy_name = f"{name}-backend"
+    probe = f"{name}-probe"
+
+    task = (
+        f"In namespace `{namespace}`, a backend Deployment (`{deploy_name}`) and Service "
+        f"(`{svc_name}`) already exist. Create an Ingress named `{name}` that routes host "
+        f"`{host}` (path `/`) to Service `{svc_name}` on port `{port}`, using ingress class "
+        f"`{ingress_class}`."
+    )
+    r = RenderResult(
+        archetype_id=q.archetype_id,
+        question_index=0,
+        task=task,
+        setup_manifests=[
+            _namespace_doc(namespace),
+            *_marker_backend(
+                deploy_name, namespace, labels, p["marker"],
+                port=port, image=backend_image, replicas=replicas,
+            ),
+            _pod_doc(probe, namespace, "busybox:1.36", {"role": "probe"}, ["sh", "-c", "sleep 3600"]),
+        ],
+    )
+    r.assertions = [
+        ResourceAssertion("ingresses.networking.k8s.io", name, namespace),
+        ResourceAssertion("ingresses.networking.k8s.io", name, namespace, "{.spec.rules[0].host}", host),
+        ResourceAssertion("ingresses.networking.k8s.io", name, namespace, "{.spec.rules[0].http.paths[0].path}", "/"),
+        ResourceAssertion(
+            "ingresses.networking.k8s.io", name, namespace,
+            "{.spec.rules[0].http.paths[0].backend.service.name}", svc_name,
+        ),
+        ResourceAssertion(
+            "ingresses.networking.k8s.io", name, namespace,
+            "{.spec.rules[0].http.paths[0].backend.service.port.number}", port,
+        ),
+        ResourceAssertion("ingresses.networking.k8s.io", name, namespace, "{.spec.ingressClassName}", ingress_class),
+        ExecContentAssertion(
+            probe, namespace, ["sh", "-c", _ingress_probe_cmd(host)],
+            expect_contains=p["marker"],
+        ),
+    ]
+    r.reference_manifests = [
+        {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "Ingress",
+            "metadata": {"name": name, "namespace": namespace},
+            "spec": {
+                "ingressClassName": ingress_class,
+                "rules": [_ingress_rule(host, svc_name, port)],
+            },
+        }
+    ]
+    return r
+
+
+def render_ingress_multi(q: QuestionSpec) -> RenderResult:
+    p = q.params
+    namespace = p["namespace"]
+    name = p["name"]
+    port = p.get("port", 80)
+    ingress_class = p.get("ingress_class", "nginx")
+    backend_image = "nginx:1.27"
+    replicas = p.get("replicas", 1)
+    probe = f"{name}-probe"
+    svc_a = f"{name}-a-svc"
+    svc_b = f"{name}-b-svc"
+    deploy_a = f"{name}-a"
+    deploy_b = f"{name}-b"
+
+    task = (
+        f"In namespace `{namespace}`, two backend Deployments (`{deploy_a}`, `{deploy_b}`) and "
+        f"Services (`{svc_a}`, `{svc_b}`) already exist. Create an Ingress named `{name}` with two "
+        f"host rules: `{p['host_a']}` -> Service `{svc_a}` and `{p['host_b']}` -> Service `{svc_b}` "
+        f"(both path `/`, port `{port}`, ingress class `{ingress_class}`)."
+    )
+    r = RenderResult(
+        archetype_id=q.archetype_id,
+        question_index=0,
+        task=task,
+        setup_manifests=[
+            _namespace_doc(namespace),
+            *_marker_backend(
+                deploy_a, namespace, p["labels_a"], p["marker_a"],
+                port=port, image=backend_image, replicas=replicas,
+            ),
+            *_marker_backend(
+                deploy_b, namespace, p["labels_b"], p["marker_b"],
+                port=port, image=backend_image, replicas=replicas,
+            ),
+            _pod_doc(probe, namespace, "busybox:1.36", {"role": "probe"}, ["sh", "-c", "sleep 3600"]),
+        ],
+    )
+    r.assertions = [
+        ResourceAssertion("ingresses.networking.k8s.io", name, namespace),
+        ResourceAssertion("ingresses.networking.k8s.io", name, namespace, "{.spec.rules[0].host}", p["host_a"]),
+        ResourceAssertion(
+            "ingresses.networking.k8s.io", name, namespace,
+            "{.spec.rules[0].http.paths[0].backend.service.name}", svc_a,
+        ),
+        ResourceAssertion(
+            "ingresses.networking.k8s.io", name, namespace,
+            "{.spec.rules[0].http.paths[0].backend.service.port.number}", port,
+        ),
+        ResourceAssertion("ingresses.networking.k8s.io", name, namespace, "{.spec.rules[1].host}", p["host_b"]),
+        ResourceAssertion(
+            "ingresses.networking.k8s.io", name, namespace,
+            "{.spec.rules[1].http.paths[0].backend.service.name}", svc_b,
+        ),
+        ResourceAssertion("ingresses.networking.k8s.io", name, namespace, "{.spec.ingressClassName}", ingress_class),
+        ExecContentAssertion(
+            probe, namespace, ["sh", "-c", _ingress_probe_cmd(p["host_a"])],
+            expect_contains=p["marker_a"],
+        ),
+        ExecContentAssertion(
+            probe, namespace, ["sh", "-c", _ingress_probe_cmd(p["host_b"])],
+            expect_contains=p["marker_b"],
+        ),
+    ]
+    r.reference_manifests = [
+        {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "Ingress",
+            "metadata": {"name": name, "namespace": namespace},
+            "spec": {
+                "ingressClassName": ingress_class,
+                "rules": [
+                    _ingress_rule(p["host_a"], svc_a, port),
+                    _ingress_rule(p["host_b"], svc_b, port),
+                ],
+            },
+        }
+    ]
+    return r
+
+
 RENDERERS = {
     "deployment": render_deployment,
     "service": render_service,
@@ -893,6 +1086,8 @@ RENDERERS = {
     "autoscaling": render_autoscaling,
     "helm": render_helm,
     "kustomize": render_kustomize,
+    "ingress": render_ingress,
+    "ingress_multi": render_ingress_multi,
 }
 
 

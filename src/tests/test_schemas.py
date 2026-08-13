@@ -247,6 +247,143 @@ def test_cm_secret_keys_must_be_valid_env_names():
     assert validate_exam_payload({"questions": [good]}, REGISTRY) == []
 
 
+def test_ingress_host_must_be_valid_dns():
+    base = {
+        "archetype": "ingress",
+        "params": {
+            "name": "ing",
+            "namespace": "app",
+            "marker": "m",
+            "labels": {"app": "a"},
+        },
+    }
+    good = {**base, "params": {**base["params"], "host": "web.example.com"}}
+    assert validate_exam_payload({"questions": [good]}, REGISTRY) == []
+
+    no_dot = {**base, "params": {**base["params"], "host": "nohost"}}
+    assert validate_exam_payload({"questions": [no_dot]}, REGISTRY) != []
+
+    bad_chars = {**base, "params": {**base["params"], "host": "bad_host.example.com"}}
+    assert validate_exam_payload({"questions": [bad_chars]}, REGISTRY) != []
+
+    bad_class = {**base, "params": {**base["params"], "host": "web.example.com", "ingress_class": "Bad!"}}
+    assert validate_exam_payload({"questions": [bad_class]}, REGISTRY) != []
+
+
+def _ingress_q(name, ns, host):
+    return {
+        "archetype": "ingress",
+        "params": {
+            "name": name,
+            "namespace": ns,
+            "host": host,
+            "marker": "m",
+            "labels": {"app": "a"},
+        },
+    }
+
+
+def test_family_cap_limits_ingress_questions():
+    questions = [_ingress_q(f"ing{i}", f"ns{i}", f"h{i}.example.com") for i in range(4)]
+    errors = validate_exam_payload({"questions": questions}, REGISTRY, max_per_family=3)
+    assert any("too many questions" in e and "ingress" in e for e in errors)
+    assert validate_exam_payload({"questions": questions[:3]}, REGISTRY, max_per_family=3) == []
+
+
+def test_ingress_hosts_must_be_unique():
+    questions = [
+        _ingress_q("a", "n1", "app.example.com"),
+        _ingress_q("b", "n2", "app.example.com"),
+    ]
+    errors = validate_exam_payload({"questions": questions}, REGISTRY)
+    assert any("app.example.com" in e and "another" in e for e in errors)
+
+
+def test_ingress_multi_host_a_b_must_differ():
+    questions = [
+        {
+            "archetype": "ingress_multi",
+            "params": {
+                "name": "s",
+                "namespace": "n",
+                "host_a": "x.example.com",
+                "host_b": "x.example.com",
+                "marker_a": "a",
+                "marker_b": "b",
+                "labels_a": {"app": "a"},
+                "labels_b": {"app": "b"},
+            },
+        }
+    ]
+    errors = validate_exam_payload({"questions": questions}, REGISTRY)
+    assert any("host_a" in e for e in errors)
+
+
+def test_ingress_multi_hosts_join_uniqueness():
+    questions = [
+        _ingress_q("a", "n1", "app.example.com"),
+        {
+            "archetype": "ingress_multi",
+            "params": {
+                "name": "s",
+                "namespace": "n2",
+                "host_a": "app.example.com",
+                "host_b": "other.example.com",
+                "marker_a": "a",
+                "marker_b": "b",
+                "labels_a": {"app": "a"},
+                "labels_b": {"app": "b"},
+            },
+        },
+    ]
+    errors = validate_exam_payload({"questions": questions}, REGISTRY)
+    assert any("app.example.com" in e and "another" in e for e in errors)
+
+
+def test_workload_images_must_stay_running():
+    """busybox/alpine/python exit immediately and must not be used for workloads
+    whose Deployments must become Ready."""
+    base_deploy = {
+        "archetype": "deployment",
+        "params": {
+            "name": "web", "namespace": "app", "replicas": 1, "labels": {"app": "web"},
+        },
+    }
+    for bad in ("busybox:1.36", "alpine:3.20", "python:3.12-slim"):
+        q = {**base_deploy, "params": {**base_deploy["params"], "image": bad}}
+        assert validate_exam_payload({"questions": [q]}, REGISTRY) != [], bad
+    for good in ("nginx:1.27", "redis:7.2", "httpd:2.4", "memcached:1.6"):
+        q = {**base_deploy, "params": {**base_deploy["params"], "image": good}}
+        assert validate_exam_payload({"questions": [q]}, REGISTRY) == [], good
+
+
+def test_crashloop_image_must_serve_http():
+    base = {
+        "archetype": "troubleshooting_crashloop",
+        "params": {
+            "name": "broken", "namespace": "ops", "labels": {"app": "broken"},
+            "replicas": 1, "failure": "bad_liveness",
+        },
+    }
+    for bad in ("busybox:1.36", "redis:7.2", "memcached:1.6"):
+        q = {**base, "params": {**base["params"], "image": bad}}
+        assert validate_exam_payload({"questions": [q]}, REGISTRY) != [], bad
+    for good in ("nginx:1.27", "httpd:2.4"):
+        q = {**base, "params": {**base["params"], "image": good}}
+        assert validate_exam_payload({"questions": [q]}, REGISTRY) == [], good
+
+
+def test_ingress_backend_image_not_expected():
+    q = {
+        "archetype": "ingress",
+        "params": {
+            "name": "ing", "namespace": "app", "host": "web.example.com",
+            "marker": "m", "labels": {"app": "a"}, "backend_image": "nginx:1.27",
+        },
+    }
+    assert validate_exam_payload({"questions": [q]}, REGISTRY) != []  # extra param rejected
+
+
 def test_parse_json_strips_fences():
     assert parse_json('```json\n{"a": 1}\n```') == {"a": 1}
     assert parse_json('{"a": 1}') == {"a": 1}

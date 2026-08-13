@@ -50,6 +50,28 @@ IMAGE_ALLOWLIST: list[str] = [
     "python:3.12-slim",
 ]
 
+# Images that keep running without an explicit command. Archetypes whose
+# reference/setup Deployments must become Ready (availableReplicas) must only
+# use these — busybox/alpine/python exit immediately and would CrashLoop.
+LONG_RUNNING_IMAGES: list[str] = [
+    "nginx:1.27",
+    "nginx:1.26",
+    "nginx:1.25",
+    "redis:7.2",
+    "redis:6.2",
+    "httpd:2.4",
+    "memcached:1.6",
+]
+
+# Images that serve HTTP on port 80 (used where a liveness probe or an ingress
+# backend must answer HTTP).
+HTTP_IMAGES: list[str] = [
+    "nginx:1.27",
+    "nginx:1.26",
+    "nginx:1.25",
+    "httpd:2.4",
+]
+
 # DNS-1123 subdomain, i.e. k8s object names.
 K8S_NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 # DNS-1123 label value.
@@ -77,6 +99,14 @@ def label_schema() -> dict:
 
 def image_schema() -> dict:
     return {"type": "string", "enum": IMAGE_ALLOWLIST}
+
+
+def long_running_image_schema() -> dict:
+    return {"type": "string", "enum": LONG_RUNNING_IMAGES}
+
+
+def http_image_schema() -> dict:
+    return {"type": "string", "enum": HTTP_IMAGES}
 
 
 def parse_json(text: str) -> object:
@@ -121,7 +151,7 @@ def validate_archetype_params(archetype, params: dict) -> list[str]:
     return errors + extra
 
 
-def validate_exam_payload(payload: object, registry) -> list[str]:
+def validate_exam_payload(payload: object, registry, max_per_family: int = 3) -> list[str]:
     """Validate a full LLM generation payload. Returns human-readable errors."""
     from jsonschema import Draft202012Validator  # local import
 
@@ -131,8 +161,12 @@ def validate_exam_payload(payload: object, registry) -> list[str]:
     if not isinstance(payload, dict):
         return ["payload must be an object"]
 
+    from .archetypes import family_of, ingress_hosts
+
     questions = payload["questions"]
     seen: set[tuple[str, str]] = set()
+    family_counts: dict[str, int] = {}
+    seen_hosts: set[str] = set()
     result: list[str] = []
 
     for index, question in enumerate(questions, start=1):
@@ -149,6 +183,20 @@ def validate_exam_payload(payload: object, registry) -> list[str]:
         for message in param_errors:
             result.append(f"question {index} ({archetype_id}): {message}")
 
+        family = family_of(archetype_id)
+        family_counts[family] = family_counts.get(family, 0) + 1
+
+        if archetype_id == "ingress_multi":
+            if params.get("host_a") and params.get("host_a") == params.get("host_b"):
+                result.append(
+                    f"question {index}: ingress_multi host_a and host_b must differ"
+                )
+
+        for host in ingress_hosts(params):
+            if host in seen_hosts:
+                result.append(f"question {index}: host {host!r} is used by another question")
+            seen_hosts.add(host)
+
         name = params.get("name")
         namespace = params.get("namespace")
         if isinstance(name, str) and isinstance(namespace, str):
@@ -156,6 +204,13 @@ def validate_exam_payload(payload: object, registry) -> list[str]:
             if key in seen:
                 result.append(f"question {index}: duplicate (namespace={namespace!r}, name={name!r})")
             seen.add(key)
+
+    for family, count in sorted(family_counts.items()):
+        if count > max_per_family:
+            result.append(
+                f"too many questions from the '{family}' family ({count} > {max_per_family}); "
+                f"replace some with other archetypes"
+            )
 
     return result
 

@@ -66,6 +66,9 @@ def preflight_result(
     try:
         apply_reference(kubectl, result, node_name)
         wait_for_manifests(kubectl, result.reference_manifests, timeout=240)
+        # Give controllers (e.g. ingress-nginx route sync) a moment to observe
+        # the reference before the satisfied-poll starts.
+        time.sleep(4)
         if not _wait_satisfied(kubectl, result, timeout=satisfied_timeout):
             failed = [
                 r.description for r in run_assertions(result.assertions, kubectl.run) if not r.passed

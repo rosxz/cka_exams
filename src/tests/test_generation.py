@@ -111,3 +111,80 @@ def test_prompt_lists_rejected_questions():
     assert "configmap_secret" in prompt
     assert "cfg" in prompt
     assert "Do NOT recreate" in prompt
+
+
+def test_prompt_mentions_family_cap_and_unique_hosts():
+    from cka_mock.generation import build_generation_prompt
+
+    prompt = build_generation_prompt(
+        topics=[],
+        num_questions=4,
+        difficulty="medium",
+        max_per_family=3,
+    )
+    assert "At most 3 questions" in prompt
+    assert "ingress" in prompt and "ingress_multi" in prompt
+    assert "All Ingress host names must be unique" in prompt
+
+
+def test_generate_replacement_question_valid():
+    from cka_mock.generation import generate_replacement_question
+
+    provider = StaticProvider(json.dumps({
+        "questions": [{
+            "archetype": "deployment",
+            "params": {
+                "name": "new-app", "namespace": "app",
+                "image": "nginx:1.27", "replicas": 1, "labels": {"app": "new-app"},
+            },
+        }]
+    }))
+    q = generate_replacement_question(
+        provider,
+        existing_questions=[],
+        failed_question={"archetype": "configmap_secret", "params": {}},
+    )
+    assert q.archetype_id == "deployment"
+    assert q.params["name"] == "new-app"
+
+
+def test_generate_replacement_question_avoids_collisions():
+    from cka_mock.generation import generate_replacement_question
+
+    existing = [{
+        "archetype": "deployment",
+        "params": {"name": "app", "namespace": "n", "image": "nginx:1.27", "replicas": 1, "labels": {"app": "a"}},
+    }]
+    colliding = json.dumps({"questions": [{
+        "archetype": "deployment",
+        "params": {"name": "app", "namespace": "n", "image": "nginx:1.27", "replicas": 1, "labels": {"app": "a"}},
+    }]})
+    valid = json.dumps({"questions": [{
+        "archetype": "deployment",
+        "params": {"name": "other", "namespace": "other", "image": "nginx:1.27", "replicas": 1, "labels": {"app": "a"}},
+    }]})
+    q = generate_replacement_question(
+        SequenceProvider([colliding, valid]),
+        existing_questions=existing,
+        failed_question={"archetype": "deployment", "params": {}},
+    )
+    assert q.params["name"] == "other"
+
+
+def test_generate_replacement_question_requires_exactly_one():
+    from cka_mock.generation import generate_replacement_question
+
+    provider = StaticProvider(json.dumps({"questions": [
+        {
+            "archetype": "deployment",
+            "params": {"name": "a", "namespace": "n", "image": "nginx:1.27", "replicas": 1, "labels": {"app": "a"}},
+        },
+        {
+            "archetype": "pvc",
+            "params": {"name": "b", "namespace": "n", "access_mode": "ReadWriteOnce", "size": "100Mi", "storage_class": "standard"},
+        },
+    ]}))
+    with pytest.raises(GenerationError):
+        generate_replacement_question(
+            provider, existing_questions=[], failed_question={}, max_attempts=1
+        )

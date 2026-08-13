@@ -30,6 +30,8 @@ class Config:
     questions: int = 17
     duration_minutes: int = 120
     exam_attempts: int = 3
+    repair_attempts: int = 3
+    max_per_family: int = 3
     workdir_root: Path = field(default_factory=default_workdir_root)
     topics: list[str] = field(default_factory=list)
     addons: list[str] = field(default_factory=lambda: ["metrics-server"])
@@ -59,6 +61,8 @@ def _coerce(key: str, value):
         "questions",
         "duration_minutes",
         "exam_attempts",
+        "repair_attempts",
+        "max_per_family",
     ):
         return value if key == "minikube_cni" else int(value)
     return value

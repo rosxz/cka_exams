@@ -11,11 +11,11 @@ from rich.console import Console
 from .config import Config
 from .env import MinikubeEnv
 from .grader import grade_exam
-from .generation import generate_exam_plan
+from .generation import generate_exam_plan, generate_replacement_question
 from .history import add_fingerprints, load_fingerprints, record_grade
-from .preflight import preflight_result
+from .preflight import PreflightError, preflight_result
 from .providers import build_provider
-from .renderer import render_exam, render_task_markdown
+from .renderer import _dump, render_exam, render_task_markdown
 from .report import render_text_report
 from .setup import apply_result_setup, wait_for_manifests
 from .workdir import Workdir
@@ -61,6 +61,7 @@ def run_new(cfg: Config, *, topics_override, questions_override, difficulty_over
             difficulty=difficulty,
             fingerprints=load_fingerprints(cfg.workdir_root),
             rejected=rejected or None,
+            max_per_family=cfg.max_per_family,
         )
         add_fingerprints(
             cfg.workdir_root, [q.params | {"archetype": q.archetype_id} for q in plan.questions]
@@ -68,7 +69,7 @@ def run_new(cfg: Config, *, topics_override, questions_override, difficulty_over
         results = render_exam(plan)
         exam_dir = workdir.new_exam()
         try:
-            return _run_exam_flow(cfg, plan, results, workdir, exam_dir, raw=raw)
+            return _run_exam_flow(cfg, plan, results, workdir, exam_dir, raw=raw, provider=provider)
         except KeyboardInterrupt:
             _cleanup_failed_exam(exam_dir)
             raise
@@ -112,13 +113,60 @@ def _cleanup_failed_exam(exam_dir: Path) -> None:
         shutil.rmtree(exam_dir, ignore_errors=True)
 
 
-def _run_exam_flow(cfg, plan, results, workdir, exam_dir, *, raw) -> int:
+def _cleanup_question_setup(kubectl, result) -> None:
+    """Best-effort removal of a replaced question's setup artifacts.
+
+    Namespaces are left in place (they may be shared with other questions and
+    deleting them risks a delete/recreate race); only the question's own objects
+    are removed.
+    """
+    for doc in result.setup_manifests:
+        if doc.get("kind") == "Namespace":
+            continue
+        kubectl.run(
+            ["delete", "-f", "-", "--ignore-not-found"],
+            input=_dump(doc),
+            timeout=120,
+        )
+
+
+def _repair_question(provider, plan, failed_index: int, *, max_per_family: int):
+    """Ask the LLM for a replacement for the failing question, keeping the rest."""
+    existing = [
+        {"archetype": q.archetype_id, "params": q.params}
+        for i, q in enumerate(plan.questions)
+        if i != failed_index
+    ]
+    failed = {
+        "archetype": plan.questions[failed_index].archetype_id,
+        "params": plan.questions[failed_index].params,
+    }
+    return generate_replacement_question(
+        provider,
+        existing_questions=existing,
+        failed_question=failed,
+        max_per_family=max_per_family,
+    )
+
+
+_INGRESS_ARCHETYPES = ("ingress", "ingress_multi")
+
+
+def _needed_addons(cfg: Config, results) -> list[str]:
+    """Baseline addons from config, plus ingress whenever the exam needs it."""
+    addons = list(cfg.addons)
+    if any(r.archetype_id in _INGRESS_ARCHETYPES for r in results) and "ingress" not in addons:
+        addons.append("ingress")
+    return addons
+
+
+def _run_exam_flow(cfg, plan, results, workdir, exam_dir, *, raw, provider=None) -> int:
     env = MinikubeEnv(
         profile=cfg.minikube_profile,
         cpus=cfg.minikube_cpus,
         memory=cfg.minikube_memory,
         cni=cfg.minikube_cni,
-        addons=tuple(cfg.addons),
+        addons=tuple(_needed_addons(cfg, results)),
     )
     console.print(f"[bold]Preparing minikube profile[/bold] {cfg.minikube_profile} ...")
     env.start(reset=True, log=lambda msg: console.print(msg))
@@ -137,18 +185,14 @@ def _run_exam_flow(cfg, plan, results, workdir, exam_dir, *, raw) -> int:
         console.print("[yellow]warn[/yellow] this exam includes a Helm challenge but `helm` is not on PATH")
 
     console.print(f"[bold]Cluster ready[/bold] (node {node_name}). Setting up challenges...")
-    preflight_warnings: list[str] = []
-    for result in results:
-        console.print(f"  Q{result.question_index}: {result.archetype_id} ...")
-        skip_kinds = {"Deployment"} if result.archetype_id == "troubleshooting_crashloop" else None
-        apply_result_setup(kubectl, result, node_name)
-        setup_warnings = wait_for_manifests(kubectl, result.setup_manifests, skip_kinds=skip_kinds)
-        for warning in setup_warnings:
-            console.print(f"    [yellow]warn[/yellow] Q{result.question_index}: {warning}")
-        report = preflight_result(kubectl, result, node_name)
-        preflight_warnings.extend(report.warnings)
-        for warning in report.warnings:
-            console.print(f"    [yellow]preflight[/yellow] Q{result.question_index}: {warning}")
+    preflight_warnings, repaired = _setup_questions(
+        cfg, plan, results, provider, kubectl, node_name, log=console.print
+    )
+
+    if repaired:
+        workdir.save_plan(exam_dir, plan)
+        workdir.write(exam_dir, "questions.md", render_task_markdown(results))
+        _write_exam_files(exam_dir, results)
 
     workdir.write(exam_dir, "preflight.json", json.dumps({"warnings": preflight_warnings}, indent=2))
 
@@ -158,6 +202,11 @@ def _run_exam_flow(cfg, plan, results, workdir, exam_dir, *, raw) -> int:
     console.print(f"  Questions: {len(results)}")
     console.print(f"  Duration : {cfg.duration_minutes} min")
     console.print(f"  Context  : {cfg.minikube_profile}")
+    if repaired:
+        console.print(
+            f"  [yellow]Note[/yellow]: {len(repaired)} question(s) were regenerated in place: "
+            f"Q{', Q'.join(str(i + 1) for i in repaired)}"
+        )
     console.print()
     console.print("  Solve the questions in your terminal, e.g.:")
     console.print(f"    export KUBECONFIG={exam_dir / 'kubeconfig'}")
@@ -165,6 +214,71 @@ def _run_exam_flow(cfg, plan, results, workdir, exam_dir, *, raw) -> int:
     console.print(f"    ls {exam_dir / 'files'}   # provided files for file-based challenges")
     console.print("  When done, grade with:  cka-mock grade")
     return 0
+
+
+def _setup_questions(cfg, plan, results, provider, kubectl, node_name, *, log) -> tuple[list[str], list[int]]:
+    """Apply setup and preflight each question, repairing failures in place.
+
+    When a question fails preflight and an LLM provider is available, that one
+    question is regenerated and retried here — the rest of the exam is kept.
+    Returns ``(preflight_warnings, repaired_indices)``.
+    """
+    preflight_warnings: list[str] = []
+    repaired: list[int] = []
+
+    for index, result in enumerate(results):
+        repaired_this_question = False
+        repairs_left = max(0, cfg.repair_attempts) if provider is not None else 0
+        while True:
+            log(f"  Q{result.question_index}: {result.archetype_id} ...")
+            skip_kinds = {"Deployment"} if result.archetype_id == "troubleshooting_crashloop" else None
+            apply_result_setup(kubectl, result, node_name)
+            setup_warnings = wait_for_manifests(kubectl, result.setup_manifests, skip_kinds=skip_kinds)
+            for warning in setup_warnings:
+                log(f"    [yellow]warn[/yellow] Q{result.question_index}: {warning}")
+            try:
+                report = preflight_result(kubectl, result, node_name)
+                break
+            except PreflightError as exc:
+                if repairs_left <= 0:
+                    raise
+                repairs_left -= 1
+                log(
+                    f"    [yellow]Q{result.question_index} failed preflight: {exc}[/yellow]"
+                )
+                log(
+                    f"    regenerating just this challenge ({repairs_left + 1} repair attempt(s) left) ..."
+                )
+                try:
+                    replacement = _repair_question(
+                        provider, plan, index, max_per_family=cfg.max_per_family
+                    )
+                except Exception as rep_exc:  # noqa: BLE001
+                    raise PreflightError(
+                        f"Q{result.question_index}: could not generate a replacement: {rep_exc}"
+                    ) from rep_exc
+                plan.questions[index] = replacement
+                repaired_this_question = True
+                new_result = _render_single(replacement, index + 1)
+                _cleanup_question_setup(kubectl, result)
+                results[index] = new_result
+                result = new_result
+        preflight_warnings.extend(report.warnings)
+        for warning in report.warnings:
+            log(f"    [yellow]preflight[/yellow] Q{result.question_index}: {warning}")
+        if repaired_this_question:
+            repaired.append(index)
+
+    return preflight_warnings, repaired
+
+
+def _render_single(question, question_index: int):
+    from .renderer import RENDERERS
+
+    renderer = RENDERERS[question.archetype_id]
+    result = renderer(question)
+    result.question_index = question_index
+    return result
 
 
 def _write_exam_files(exam_dir: Path, results) -> None:

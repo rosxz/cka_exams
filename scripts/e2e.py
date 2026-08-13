@@ -182,6 +182,33 @@ PAYLOAD = {
                 "replicas": 2,
             },
         },
+        {
+            "archetype": "ingress",
+            "params": {
+                "name": "web-ing",
+                "namespace": "ingressapp",
+                "host": "web.example.com",
+                "marker": "backend-web-marker",
+                "labels": {"app": "web"},
+                "ingress_class": "nginx",
+                "port": 80,
+            },
+        },
+        {
+            "archetype": "ingress_multi",
+            "params": {
+                "name": "shop-ing",
+                "namespace": "shop",
+                "host_a": "shop.example.com",
+                "host_b": "admin.example.com",
+                "marker_a": "shop-marker",
+                "marker_b": "admin-marker",
+                "labels_a": {"app": "shop"},
+                "labels_b": {"app": "admin"},
+                "ingress_class": "nginx",
+                "port": 80,
+            },
+        },
     ]
 }
 
@@ -191,9 +218,13 @@ def main() -> int:
     plan, _raw = generate_exam_plan(provider, topics=["all"], num_questions=len(PAYLOAD["questions"]))
     results = render_exam(plan)
 
+    from cka_mock.config import Config
+    from cka_mock.exam import _needed_addons
+
+    addons = _needed_addons(Config(addons=["metrics-server"]), results)
     work_root = Path("/tmp/cka_e2e_work")
-    env = MinikubeEnv(profile="cka-exam", addons=("metrics-server",))
-    env.start(reset=True)
+    env = MinikubeEnv(profile="cka-exam", addons=tuple(addons))
+    env.start(reset=True, log=lambda m: print(m))
 
     wd = Workdir(work_root)
     exam_dir = wd.new_exam()

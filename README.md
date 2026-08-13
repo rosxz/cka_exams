@@ -58,7 +58,14 @@ Implemented and verified end-to-end on a real minikube cluster
 
 Archetypes currently supported: deployment, service, pvc, networkpolicy (behavioral
 probes), rbac, scheduling (nodeSelector + limits), troubleshooting_crashloop,
-configmap_secret, fix_served_file, cni_config, autoscaling (HPA), helm, kustomize.
+configmap_secret, fix_served_file, cni_config, autoscaling (HPA), helm, kustomize,
+ingress, ingress_multi (host-based routing, behaviorally verified through the
+ingress-nginx controller).
+
+Workload archetypes whose Deployments must become Ready only allow long-running
+images (nginx/redis/httpd/memcached); crash-loop troubleshooting is restricted to
+HTTP-serving images, so the generated reference solutions can never CrashLoop from
+an image that exits immediately (e.g. busybox/alpine/python).
 
 Planned:
 
@@ -70,12 +77,22 @@ Planned:
 
 - NetworkPolicy challenges require a policy-enforcing CNI; the env defaults to Calico
   (`minikube_cni = "calico"` in config).
-- Default addons are `metrics-server` only. The `ingress` addon is slow and, unlabeled,
-  leaves controller pods Pending — if you opt in via config, the tool auto-labels the
-  node `ingress-ready=true` first.
+- Default addons are `metrics-server` only. When an exam contains an `ingress`/`ingress_multi`
+  question the tool auto-enables the minikube `ingress` addon: it labels the node
+  (`minikube.k8s.io/primary=true`, `ingress-ready=true`), then waits until the
+  ingress-nginx controller, its admission certgen jobs, and the validating webhook are all
+  working before serving — so Ingress creation never fails on a not-ready webhook.
+- `cka-mock new --topics ingress` focuses an exam on the Ingress category.
 - If any question fails preflight (reference not satisfiable, e.g. an unschedulable
-  setup), `cka-mock new` retries up to `exam_attempts` (default 3) times: it regenerates
-  a different challenge set and marks the failed questions as rejected in the next prompt.
+  setup), `cka-mock new` first tries to **regenerate just that one challenge in place**
+  (`repair_attempts`, default 3): the LLM is asked for a single replacement that still
+  fits the rest of the exam (no name/host collisions, family caps honored), the old
+  question's cluster artifacts are cleaned up, and it is retried. Only if repair keeps
+  failing does the whole exam regenerate (`exam_attempts`).
+- At most `max_per_family` questions may come from the same archetype family (default 3;
+  the `ingress` family = `ingress` + `ingress_multi`), and all Ingress host names must be
+  unique within an exam — otherwise the ingress controller would route one host to the
+  wrong backend. Set e.g. `max_per_family = 2` in `cka-mock.toml` for tighter limits.
 - `cka-mock new` needs an OpenCode key (`OPENCODE_API_KEY`). Use `scripts/e2e.py` for an
   offline full-loop test (no LLM).
 - Set `CKA_MOCK_DEBUG=1` for verbose preflight polling.

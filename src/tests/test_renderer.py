@@ -114,6 +114,27 @@ VALID_PARAMS = {
         "image": "nginx:1.27",
         "replicas": 2,
     },
+    "ingress": {
+        "name": "web-ing",
+        "namespace": "app",
+        "host": "web.example.com",
+        "marker": "backend-web-marker",
+        "labels": {"app": "web"},
+        "ingress_class": "nginx",
+        "port": 80,
+    },
+    "ingress_multi": {
+        "name": "shop-ing",
+        "namespace": "shop",
+        "host_a": "shop.example.com",
+        "host_b": "admin.example.com",
+        "marker_a": "shop-marker",
+        "marker_b": "admin-marker",
+        "labels_a": {"app": "shop"},
+        "labels_b": {"app": "admin"},
+        "ingress_class": "nginx",
+        "port": 80,
+    },
 }
 
 
@@ -235,6 +256,40 @@ def test_kustomize_reference_namespace_scoped():
     assert reference["metadata"]["name"] == "prod-app"
     assert reference["metadata"]["namespace"] == "prod"
     assert any("Namespace" in {d.get("kind")} for d in result.setup_manifests)
+
+
+def test_ingress_renderer_has_declarative_and_behavioral_checks():
+    from cka_mock.assertion import ExecContentAssertion, ResourceAssertion
+
+    result = RENDERERS["ingress"](_spec("ingress"))
+    declarative = {a.jsonpath for a in result.assertions if isinstance(a, ResourceAssertion) and a.jsonpath}
+    assert "{.spec.rules[0].host}" in declarative
+    assert "{.spec.rules[0].http.paths[0].backend.service.name}" in declarative
+    assert "{.spec.ingressClassName}" in declarative
+    behavioral = [a for a in result.assertions if isinstance(a, ExecContentAssertion)]
+    assert len(behavioral) == 1
+    assert behavioral[0].expect_contains == "backend-web-marker"
+    assert "ingress-nginx-controller.ingress-nginx.svc" in behavioral[0].command[-1]
+    assert "-T 10" in behavioral[0].command[-1]
+    # reference Ingress routes the host to the backend service
+    ref = result.reference_manifests[0]
+    assert ref["spec"]["rules"][0]["host"] == "web.example.com"
+    assert ref["spec"]["rules"][0]["http"]["paths"][0]["backend"]["service"]["name"] == "web-ing-backend-svc"
+    assert ref["spec"]["ingressClassName"] == "nginx"
+    # setup creates the backend + a probe pod
+    kinds = {d.get("kind") for d in result.setup_manifests}
+    assert {"Namespace", "ConfigMap", "Deployment", "Service", "Pod"} <= kinds
+
+
+def test_ingress_multi_renderer_two_rules_two_probes():
+    from cka_mock.assertion import ExecContentAssertion
+
+    result = RENDERERS["ingress_multi"](_spec("ingress_multi"))
+    behavioral = [a for a in result.assertions if isinstance(a, ExecContentAssertion)]
+    assert {a.expect_contains for a in behavioral} == {"shop-marker", "admin-marker"}
+    ref = result.reference_manifests[0]
+    assert [rule["host"] for rule in ref["spec"]["rules"]] == ["shop.example.com", "admin.example.com"]
+    assert {d.get("kind") for d in result.setup_manifests} >= {"ConfigMap", "Service", "Pod"}
 
 
 def test_every_renderer_produces_artifacts():

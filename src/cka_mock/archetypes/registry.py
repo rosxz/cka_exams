@@ -14,7 +14,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-from ..schemas import image_schema, label_schema, name_schema
+from ..schemas import (
+    http_image_schema,
+    label_schema,
+    long_running_image_schema,
+    name_schema,
+)
 
 # Official CKA 2025/2026 domain weightings (Linux Foundation).
 DOMAINS: dict[str, int] = {
@@ -24,6 +29,30 @@ DOMAINS: dict[str, int] = {
     "Cluster Architecture, Installation & Configuration": 25,
     "Services & Networking": 20,
 }
+
+# Archetype families: questions in the same family share cluster-level resources
+# (e.g. the ingress controller routes by Host, so two questions sharing a host
+# would conflict). The generator caps how many questions one family may produce.
+FAMILIES: dict[str, tuple[str, ...]] = {
+    "ingress": ("ingress", "ingress_multi"),
+}
+
+
+def family_of(archetype_id: str) -> str:
+    for family, members in FAMILIES.items():
+        if archetype_id in members:
+            return family
+    return archetype_id
+
+
+def ingress_hosts(params: dict) -> list[str]:
+    """All Host values an ingress-family question claims."""
+    hosts = []
+    for key in ("host", "host_a", "host_b"):
+        value = params.get(key)
+        if isinstance(value, str):
+            hosts.append(value)
+    return hosts
 
 
 @dataclass(frozen=True)
@@ -63,7 +92,7 @@ _register(Archetype(
         "properties": {
             "name": name_schema(),
             "namespace": name_schema(),
-            "image": image_schema(),
+            "image": long_running_image_schema(),
             "replicas": {"type": "integer", "minimum": 1, "maximum": 50},
             "labels": label_schema(),
             "container_port": {"type": "integer", "minimum": 1, "maximum": 65535},
@@ -91,7 +120,7 @@ _register(Archetype(
             "port": {"type": "integer", "minimum": 1, "maximum": 65535},
             "target_port": {"type": "integer", "minimum": 1, "maximum": 65535},
             "backend_labels": label_schema(),
-            "backend_image": image_schema(),
+            "backend_image": long_running_image_schema(),
             "backend_replicas": {"type": "integer", "minimum": 1, "maximum": 10},
         },
         "additionalProperties": False,
@@ -199,7 +228,7 @@ _register(Archetype(
         "properties": {
             "name": name_schema(),
             "namespace": name_schema(),
-            "image": image_schema(),
+            "image": long_running_image_schema(),
             "replicas": {"type": "integer", "minimum": 1, "maximum": 10},
             "labels": label_schema(),
             "node_label_key": {"type": "string", "pattern": r"^[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?$"},
@@ -226,7 +255,9 @@ _register(Archetype(
         "properties": {
             "name": name_schema(),
             "namespace": name_schema(),
-            "image": image_schema(),
+            # The "bad_liveness" failure needs an image that serves HTTP on :80,
+            # otherwise the *fixed* reference would also crash.
+            "image": http_image_schema(),
             "labels": label_schema(),
             "replicas": {"type": "integer", "minimum": 1, "maximum": 5},
             "failure": {"type": "string", "enum": ["bad_liveness", "exit_immediately"]},
@@ -252,6 +283,17 @@ def _env_map_schema() -> dict:
     }
 
 
+def _host_schema() -> dict:
+    # DNS hostname with at least one dot (e.g. app.example.com). Hosts are only
+    # used as HTTP Host headers by the behavioral probe, so no real DNS is needed.
+    return {
+        "type": "string",
+        "pattern": r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)+$",
+        "minLength": 4,
+        "maxLength": 253,
+    }
+
+
 _register(Archetype(
     id="configmap_secret",
     domain="Workloads & Scheduling",
@@ -271,7 +313,7 @@ _register(Archetype(
             "cm_data": _env_map_schema(),
             "secret_data": _env_map_schema(),
             "deploy_name": name_schema(),
-            "image": image_schema(),
+            "image": long_running_image_schema(),
             "replicas": {"type": "integer", "minimum": 1, "maximum": 10},
             "labels": label_schema(),
         },
@@ -348,7 +390,7 @@ _register(Archetype(
             "min": {"type": "integer", "minimum": 1, "maximum": 20},
             "max": {"type": "integer", "minimum": 1, "maximum": 50},
             "cpu_target": {"type": "integer", "minimum": 1, "maximum": 100},
-            "image": image_schema(),
+            "image": long_running_image_schema(),
             "replicas": {"type": "integer", "minimum": 1, "maximum": 10},
             "labels": label_schema(),
         },
@@ -373,7 +415,7 @@ _register(Archetype(
             "release": name_schema(),
             "namespace": name_schema(),
             "chart_name": name_schema(),
-            "image": image_schema(),
+            "image": long_running_image_schema(),
             "replicas": {"type": "integer", "minimum": 1, "maximum": 10},
             "service_port": {"type": "integer", "minimum": 1, "maximum": 65535, "default": 80},
         },
@@ -399,8 +441,74 @@ _register(Archetype(
             "overlay": name_schema(),
             "name_prefix": {"type": "string", "pattern": r"^[a-zA-Z0-9-]+$", "minLength": 1},
             "base_name": name_schema(),
-            "image": image_schema(),
+            "image": long_running_image_schema(),
             "replicas": {"type": "integer", "minimum": 1, "maximum": 10},
+        },
+        "additionalProperties": False,
+    },
+))
+
+
+_register(Archetype(
+    id="ingress",
+    domain="Services & Networking",
+    competency="Know how to use Ingress controllers and Ingress resources",
+    title="Expose a service via Ingress",
+    description=(
+        "A backend Deployment and Service already exist; create an Ingress for a given host "
+        "that routes to it (ingressClassName nginx)."
+    ),
+    topics=("ingress", "networking", "services"),
+    params_schema={
+        "type": "object",
+        "required": ["name", "namespace", "host", "marker", "labels"],
+        "properties": {
+            "name": name_schema(),
+            "namespace": name_schema(),
+            "host": _host_schema(),
+            "ingress_class": {
+                "type": "string",
+                "pattern": r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+                "default": "nginx",
+            },
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535, "default": 80},
+            "replicas": {"type": "integer", "minimum": 1, "maximum": 5},
+            "marker": {"type": "string", "minLength": 1, "maxLength": 200},
+            "labels": label_schema(),
+        },
+        "additionalProperties": False,
+    },
+))
+
+_register(Archetype(
+    id="ingress_multi",
+    domain="Services & Networking",
+    competency="Know how to use Ingress controllers and Ingress resources",
+    title="Route two hosts to two backends via Ingress",
+    description=(
+        "Two backend Deployments and Services already exist; create an Ingress with two host "
+        "rules, one per backend (ingressClassName nginx)."
+    ),
+    topics=("ingress", "networking", "services", "routing"),
+    params_schema={
+        "type": "object",
+        "required": ["name", "namespace", "host_a", "host_b", "marker_a", "marker_b", "labels_a", "labels_b"],
+        "properties": {
+            "name": name_schema(),
+            "namespace": name_schema(),
+            "host_a": _host_schema(),
+            "host_b": _host_schema(),
+            "ingress_class": {
+                "type": "string",
+                "pattern": r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+                "default": "nginx",
+            },
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535, "default": 80},
+            "replicas": {"type": "integer", "minimum": 1, "maximum": 5},
+            "marker_a": {"type": "string", "minLength": 1, "maxLength": 200},
+            "marker_b": {"type": "string", "minLength": 1, "maxLength": 200},
+            "labels_a": label_schema(),
+            "labels_b": label_schema(),
         },
         "additionalProperties": False,
     },

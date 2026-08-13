@@ -12,6 +12,7 @@ from .providers import Provider
 from .schemas import (
     ExamPlan,
     GenerationError,
+    QuestionSpec,
     parse_json,
     payload_to_plan,
     validate_exam_payload,
@@ -25,6 +26,7 @@ def build_generation_prompt(
     difficulty: str,
     fingerprints: list[str] | None = None,
     rejected: list[dict] | None = None,
+    max_per_family: int = 3,
 ) -> str:
     lines = [
         "You generate mock CKA exam challenges as JSON.",
@@ -68,6 +70,11 @@ def build_generation_prompt(
         "environment-variable names (^[A-Za-z_][A-Za-z0-9_]*$). Use realistic, varied names "
         "and namespaces."
     )
+    lines.append(
+        f"At most {max_per_family} questions may come from the same family (the 'ingress' family "
+        f"includes both 'ingress' and 'ingress_multi'). All Ingress host names must be unique "
+        f"across the exam. Diversify archetypes."
+    )
     return "\n".join(lines)
 
 
@@ -84,6 +91,95 @@ def build_fix_prompt(previous_prompt: str, raw_output: str, errors: list[str]) -
     return "\n".join(lines)
 
 
+def build_replacement_prompt(
+    *,
+    existing_questions: list[dict],
+    failed_question: dict,
+    max_per_family: int,
+) -> str:
+    lines = [
+        "You are replacing ONE question in a CKA mock exam that failed at runtime.",
+        "Return ONLY valid JSON with exactly one question: "
+        '{"questions": [{"archetype": "<archetype id>", "params": { ... }}]}.',
+        "No markdown fences, no commentary.",
+        "",
+        "The rest of the exam (do NOT duplicate any of these names/namespaces/hosts):",
+    ]
+    for index, question in enumerate(existing_questions, start=1):
+        lines.append(
+            f"- Q{index}: {question.get('archetype')} "
+            f"{json.dumps(question.get('params', {}), sort_keys=True)}"
+        )
+    lines.append("")
+    lines.append(
+        "The question being replaced FAILED and must NOT be recreated or near-duplicated:"
+    )
+    lines.append(
+        f"- {failed_question.get('archetype')} "
+        f"{json.dumps(failed_question.get('params', {}), sort_keys=True)}"
+    )
+    lines.append("")
+    lines.append("Constraints:")
+    lines.append(
+        f"- At most {max_per_family} questions may come from the same family "
+        "(the 'ingress' family = ingress + ingress_multi)."
+    )
+    lines.append(
+        "- All names/namespaces must match ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$; Ingress hosts must "
+        "be unique DNS names; images from the allowed list; ConfigMap/Secret keys valid env names."
+    )
+    return "\n".join(lines)
+
+
+def generate_replacement_question(
+    provider: Provider,
+    *,
+    existing_questions: list[dict],
+    failed_question: dict,
+    max_per_family: int = 3,
+    max_attempts: int = 3,
+) -> QuestionSpec:
+    """Ask the provider for a single replacement question.
+
+    The candidate (existing questions + the replacement) is validated as a whole,
+    so name/host uniqueness and family caps hold across the full exam.
+    Raises :class:`GenerationError` if no valid replacement is produced.
+    """
+    prompt = build_replacement_prompt(
+        existing_questions=existing_questions,
+        failed_question=failed_question,
+        max_per_family=max_per_family,
+    )
+    errors: list[str] = []
+    raw_output = ""
+
+    for attempt in range(max_attempts):
+        prompt_text = build_fix_prompt(prompt, raw_output, errors) if attempt else prompt
+        result = provider.generate(prompt_text)
+        raw_output = result.text
+
+        try:
+            payload = parse_json(raw_output)
+        except json.JSONDecodeError as exc:
+            errors = [f"response was not valid JSON: {exc}"]
+            continue
+
+        questions = payload.get("questions") if isinstance(payload, dict) else None
+        if not isinstance(questions, list) or len(questions) != 1:
+            errors = ["must return exactly 1 question"]
+            continue
+
+        candidate = existing_questions + questions
+        errors = validate_exam_payload(
+            {"questions": candidate}, REGISTRY, max_per_family=max_per_family
+        )
+        if not errors:
+            question = questions[0]
+            return QuestionSpec(archetype_id=question["archetype"], params=question["params"])
+
+    raise GenerationError("; ".join(errors))
+
+
 def generate_exam_plan(
     provider: Provider,
     *,
@@ -92,6 +188,7 @@ def generate_exam_plan(
     difficulty: str = "medium",
     fingerprints: list[str] | None = None,
     rejected: list[dict] | None = None,
+    max_per_family: int = 3,
     max_retries: int = 3,
 ) -> tuple[ExamPlan, str]:
     """Ask the provider for an exam plan, validating with fail-closed retries.
@@ -107,6 +204,7 @@ def generate_exam_plan(
         difficulty=difficulty,
         fingerprints=fingerprints,
         rejected=rejected,
+        max_per_family=max_per_family,
     )
     errors: list[str] = []
     raw_output = ""
@@ -126,7 +224,7 @@ def generate_exam_plan(
             errors = ["response must be a JSON object"]
             continue
 
-        errors = validate_exam_payload(payload, REGISTRY)
+        errors = validate_exam_payload(payload, REGISTRY, max_per_family=max_per_family)
         if not errors:
             plan = payload_to_plan(payload, REGISTRY)
             plan.meta = {

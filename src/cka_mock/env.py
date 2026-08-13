@@ -24,6 +24,37 @@ def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
 
 
+def _run_in(cmd: list[str], stdin: str, **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, input=stdin, **kwargs)
+
+
+# minikube's ingress-nginx controller schedules only on nodes carrying these
+# labels; without them its pods stay Pending and `addons enable ingress` blocks.
+_INGRESS_NODE_LABELS = ("minikube.k8s.io/primary=true", "ingress-ready=true")
+
+# Smoke probe used to confirm the ingress validating webhook is live before any
+# real Ingress is created (the webhook uses failurePolicy: Fail).
+_INGRESS_PROBE = """apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cka-webhook-probe
+  namespace: ingress-nginx
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: probe.example.invalid
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ingress-nginx-controller
+                port:
+                  number: 80
+"""
+
+
 @dataclass
 class MinikubeEnv:
     profile: str = "cka-exam"
@@ -31,7 +62,7 @@ class MinikubeEnv:
     cpus: int | None = None
     memory: int | None = None
     cni: str | None = "calico"
-    addons: tuple[str, ...] = ("ingress", "metrics-server")
+    addons: tuple[str, ...] = ("metrics-server",)
 
     def _base(self) -> list[str]:
         if not shutil.which("minikube"):
@@ -77,17 +108,18 @@ class MinikubeEnv:
         self._wait_nodes_ready(wait_timeout)
         self._enable_addons(log)
 
-    def _enable_addons(self, log: Callable[[str], None]) -> None:
+    def _enable_addons(self, log: Callable[[str], None], ingress_timeout: int = 300) -> None:
         if "ingress" in self.addons:
-            # minikube's ingress addon controller only schedules on nodes labeled
-            # `ingress-ready=true`; label them before enabling, otherwise the
-            # controller pods stay Pending and `addons enable` blocks.
+            # The ingress-nginx controller only schedules on nodes with the
+            # `minikube.k8s.io/primary` label (and, on older manifests,
+            # `ingress-ready`). Label all nodes before enabling.
             log("  labeling node for ingress addon ...")
-            _run(
-                ["kubectl", "--context", self.profile, "label", "nodes", "--all",
-                 "ingress-ready=true", "--overwrite"],
-                timeout=60,
-            )
+            for label in _INGRESS_NODE_LABELS:
+                _run(
+                    ["kubectl", "--context", self.profile, "label", "nodes", "--all",
+                     label, "--overwrite"],
+                    timeout=60,
+                )
         for addon in self.addons:
             log(f"  enabling addon {addon} ...")
             addon_proc = _run(self._base() + ["addons", "enable", addon], timeout=120)
@@ -95,7 +127,56 @@ class MinikubeEnv:
                 raise MinikubeError(
                     f"failed to enable addon {addon}: {addon_proc.stderr.strip()}"
                 )
+        if "ingress" in self.addons:
+            self._wait_ingress_ready(log, timeout=ingress_timeout)
         log("  cluster ready")
+
+    def _wait_ingress_ready(self, log: Callable[[str], None], timeout: int = 300) -> None:
+        """Wait until the ingress controller, its admission cert jobs, and the
+        validating webhook are all actually working."""
+        log("  waiting for ingress-nginx controller + webhook ...")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._ingress_controller_available() and self._ingress_jobs_done():
+                if self._webhook_accepts_ingress():
+                    log("  ingress addon ready")
+                    return
+            time.sleep(3)
+        raise MinikubeError("ingress addon did not become ready in time")
+
+    def _ingress_controller_available(self) -> bool:
+        proc = _run(
+            ["kubectl", "--context", self.profile, "get", "deploy",
+             "ingress-nginx-controller", "-n", "ingress-nginx",
+             "-o", "jsonpath={.status.availableReplicas}"],
+            timeout=30,
+        )
+        return proc.returncode == 0 and proc.stdout.strip() not in ("", "0")
+
+    def _ingress_jobs_done(self) -> bool:
+        for job in ("ingress-nginx-admission-create", "ingress-nginx-admission-patch"):
+            proc = _run(
+                ["kubectl", "--context", self.profile, "get", "job", job,
+                 "-n", "ingress-nginx", "-o", "jsonpath={.status.succeeded}"],
+                timeout=30,
+            )
+            if not (proc.returncode == 0 and proc.stdout.strip() == "1"):
+                return False
+        return True
+
+    def _webhook_accepts_ingress(self) -> bool:
+        proc = _run_in(
+            ["kubectl", "--context", self.profile, "apply", "-f", "-"],
+            _INGRESS_PROBE,
+            timeout=60,
+        )
+        ok = proc.returncode == 0
+        _run(
+            ["kubectl", "--context", self.profile, "delete", "ingress",
+             "cka-webhook-probe", "-n", "ingress-nginx", "--ignore-not-found"],
+            timeout=60,
+        )
+        return ok
 
     def _wait_nodes_ready(self, timeout: int) -> None:
         deadline = time.monotonic() + timeout
