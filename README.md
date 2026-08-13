@@ -75,6 +75,7 @@ Planned:
 
 ## Notes
 
+- During an exam, remember to check which minikube profile is currently active.
 - NetworkPolicy challenges require a policy-enforcing CNI; the env defaults to Calico
   (`minikube_cni = "calico"` in config).
 - Default addons are `metrics-server` only. When an exam contains an `ingress`/`ingress_multi`
