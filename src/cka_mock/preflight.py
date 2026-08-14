@@ -8,11 +8,19 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .assertion import run_assertions
 from .kubectl import Kubectl
 from .renderer import RenderResult
-from .setup import apply_reference, apply_result_setup, wait_for_manifests, _dump
+from .setup import (
+    apply_install_commands,
+    apply_reference,
+    apply_result_setup,
+    apply_teardown_commands,
+    wait_for_manifests,
+    _dump,
+)
 
 
 class PreflightError(RuntimeError):
@@ -37,11 +45,17 @@ def _delete_reference(kubectl: Kubectl, result: RenderResult) -> None:
         kubectl.run(["delete", "-f", "-", "--ignore-not-found"], input=_dump(doc), timeout=120)
 
 
-def _restore(kubectl: Kubectl, result: RenderResult, node_name: str) -> None:
-    if _overlaps_setup(result):
+def _restore(
+    kubectl: Kubectl, result: RenderResult, node_name: str, files_dir: Path | None
+) -> None:
+    if result.reference_teardown_commands:
+        # Install-yourself archetype: remove the controller/CRDs the candidate
+        # will install, leaving a clean cluster.
+        apply_teardown_commands(kubectl, result, node_name, files_dir)
+    elif _overlaps_setup(result):
         # Fix archetype: the reference replaced the broken object; re-apply the
         # broken setup so the user gets the broken state back.
-        apply_result_setup(kubectl, result, node_name)
+        apply_result_setup(kubectl, result, node_name, files_dir)
     else:
         _delete_reference(kubectl, result)
 
@@ -51,6 +65,8 @@ def preflight_result(
     result: RenderResult,
     node_name: str,
     *,
+    files_dir: Path | None = None,
+    ready_timeout: int = 360,
     satisfied_timeout: int = 120,
     unsolved_timeout: int = 90,
 ) -> PreflightReport:
@@ -64,7 +80,16 @@ def preflight_result(
         )
 
     try:
-        apply_reference(kubectl, result, node_name)
+        if result.reference_install_commands:
+            apply_install_commands(kubectl, result, node_name, files_dir)
+            if result.reference_ready_assertions and not _wait_ready(
+                kubectl, result.reference_ready_assertions, timeout=ready_timeout
+            ):
+                raise PreflightError(
+                    f"Q{result.question_index}: controller install did not become ready "
+                    f"(archetype {result.archetype_id})."
+                )
+        apply_reference(kubectl, result, node_name, files_dir)
         wait_for_manifests(kubectl, result.reference_manifests, timeout=240)
         # Give controllers (e.g. ingress-nginx route sync) a moment to observe
         # the reference before the satisfied-poll starts.
@@ -78,7 +103,7 @@ def preflight_result(
                 f"challenge (archetype {result.archetype_id}). Failing checks: {failed}"
             )
     finally:
-        _restore(kubectl, result, node_name)
+        _restore(kubectl, result, node_name, files_dir)
 
     if not _wait_unsolved(kubectl, result, timeout=unsolved_timeout):
         raise PreflightError(
@@ -87,6 +112,16 @@ def preflight_result(
         )
 
     return report
+
+
+def _wait_ready(kubectl: Kubectl, assertions, timeout: int) -> bool:
+    """Poll until the controller install readiness assertions all pass."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if all(r.passed for r in run_assertions(assertions, kubectl.run)):
+            return True
+        time.sleep(5)
+    return False
 
 
 def _wait_unsolved(kubectl: Kubectl, result: RenderResult, timeout: int) -> bool:

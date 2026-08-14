@@ -135,6 +135,33 @@ VALID_PARAMS = {
         "ingress_class": "nginx",
         "port": 80,
     },
+    "crd": {
+        "plural": "widgets",
+        "singular": "widget",
+        "group": "example.com",
+        "version": "v1",
+        "kind": "Widget",
+        "scope": "Namespaced",
+        "spec_field": "size",
+        "spec_type": "string",
+        "instance_name": "widget-one",
+        "instance_namespace": "widgets",
+        "instance_value": "large",
+    },
+    "operator": {
+        "cert_name": "web-cert",
+        "namespace": "certapp",
+        "issuer_name": "self-issuer",
+        "host": "web.example.com",
+    },
+    "gateway": {
+        "name": "web-route",
+        "namespace": "gwapp",
+        "host": "web.example.com",
+        "labels": {"app": "web"},
+        "port": 80,
+        "replicas": 1,
+    },
 }
 
 
@@ -290,6 +317,55 @@ def test_ingress_multi_renderer_two_rules_two_probes():
     ref = result.reference_manifests[0]
     assert [rule["host"] for rule in ref["spec"]["rules"]] == ["shop.example.com", "admin.example.com"]
     assert {d.get("kind") for d in result.setup_manifests} >= {"ConfigMap", "Service", "Pod"}
+
+
+def test_crd_renderer():
+    from cka_mock.assertion import ResourceAssertion
+
+    result = RENDERERS["crd"](_spec("crd"))
+    assert not result.reference_install_commands
+    assert not result.reference_teardown_commands
+    assert len(result.reference_manifests) == 2  # CRD + instance
+    crd, instance = result.reference_manifests
+    assert crd["kind"] == "CustomResourceDefinition"
+    assert crd["metadata"]["name"] == "widgets.example.com"
+    assert instance["kind"] == "Widget"
+    assert instance["spec"]["size"] == "large"
+    jsonpaths = {a.jsonpath for a in result.assertions if isinstance(a, ResourceAssertion) and a.jsonpath}
+    assert "{.spec.group}" in jsonpaths and "{.spec.names.kind}" in jsonpaths
+    assert any(isinstance(a, ResourceAssertion) and a.resource == "widgets.example.com" for a in result.assertions)
+
+
+def test_operator_renderer_install_yourself():
+    from cka_mock.assertion import ResourceAssertion
+
+    result = RENDERERS["operator"](_spec("operator"))
+    assert result.files == []  # installs from the official cert-manager URL
+    assert len(result.reference_install_commands) == 1
+    assert "github.com/cert-manager/cert-manager/releases/download" in result.reference_install_commands[0][-1]
+    assert len(result.reference_teardown_commands) == 6
+    kinds = [d["kind"] for d in result.reference_manifests]
+    assert kinds == ["Issuer", "Certificate"]
+    assert any(isinstance(a, ResourceAssertion) and a.resource == "certificates.cert-manager.io" for a in result.assertions)
+
+
+def test_gateway_renderer_contour_model():
+    from cka_mock.assertion import ResourceAssertion
+
+    result = RENDERERS["gateway"](_spec("gateway"))
+    assert result.files == []  # installs from the official URL, no vendored file
+    assert len(result.reference_install_commands) == 1
+    assert "raw.githubusercontent.com/projectcontour/contour" in result.reference_install_commands[0][-1]
+    assert len(result.reference_ready_assertions) == 1
+    assert len(result.reference_teardown_commands) >= 4
+    # reference is the HTTPRoute attached to the fixed contour Gateway
+    (route,) = result.reference_manifests
+    assert route["kind"] == "HTTPRoute"
+    assert route["spec"]["parentRefs"] == [{"name": "contour", "namespace": "projectcontour"}]
+    conditions = {
+        a.jsonpath for a in result.assertions if isinstance(a, ResourceAssertion) and a.jsonpath
+    }
+    assert any('"Programmed"' in (c or "") for c in conditions)
 
 
 def test_every_renderer_produces_artifacts():

@@ -22,6 +22,7 @@ from .assertion import (
 from .schemas import QuestionSpec
 
 NODE_TOKEN = "{{NODE}}"
+FILES_TOKEN = "{{FILES}}"
 
 
 @dataclass
@@ -43,6 +44,14 @@ class RenderResult:
     reference_commands: list[list[str]] = field(default_factory=list)
     files: list[ExamFile] = field(default_factory=list)
     node_required: bool = False
+    # Install-yourself challenges (Gateway API / operators): commands that
+    # install cluster-scoped components (CRDs, controller) before the reference
+    # resources can be created, assertions that must pass once the controller is
+    # up, and commands to fully tear the install down so the candidate starts
+    # from a clean cluster.
+    reference_install_commands: list[list[str]] = field(default_factory=list)
+    reference_ready_assertions: list[Assertion] = field(default_factory=list)
+    reference_teardown_commands: list[list[str]] = field(default_factory=list)
 
 
 def _dump(doc: dict) -> str:
@@ -1072,6 +1081,271 @@ def render_ingress_multi(q: QuestionSpec) -> RenderResult:
     return r
 
 
+def render_crd(q: QuestionSpec) -> RenderResult:
+    p = q.params
+    plural = p["plural"]
+    group = p["group"]
+    crd_name = f"{plural}.{group}"
+    version = p["version"]
+    kind = p["kind"]
+    scope = p["scope"]
+    spec_field = p["spec_field"]
+    spec_type = p["spec_type"]
+    instance_name = p["instance_name"]
+    instance_ns = p["instance_namespace"] if scope == "Namespaced" else None
+    instance_value = p["instance_value"]
+
+    if spec_type == "integer":
+        spec_value: object = int(instance_value)
+    elif spec_type == "boolean":
+        spec_value = instance_value == "true"
+    else:
+        spec_value = instance_value
+
+    crd_doc = {
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {"name": crd_name},
+        "spec": {
+            "group": group,
+            "names": {"kind": kind, "plural": plural, "singular": p["singular"]},
+            "scope": scope,
+            "versions": [
+                {
+                    "name": version,
+                    "served": True,
+                    "storage": True,
+                    "schema": {
+                        "openAPIV3Schema": {
+                            "type": "object",
+                            "properties": {
+                                "spec": {
+                                    "type": "object",
+                                    "properties": {spec_field: {"type": spec_type}},
+                                }
+                            },
+                            "required": ["spec"],
+                        }
+                    },
+                }
+            ],
+        },
+    }
+    instance_doc = {
+        "apiVersion": f"{group}/{version}",
+        "kind": kind,
+        "metadata": {"name": instance_name},
+        "spec": {spec_field: spec_value},
+    }
+    if instance_ns:
+        instance_doc["metadata"]["namespace"] = instance_ns
+
+    task = (
+        f"The `{crd_name}` custom resource is NOT defined. Create a CustomResourceDefinition "
+        f"named `{crd_name}` (group `{group}`, version `{version}`, kind `{kind}`, plural `{plural}`, "
+        f"scope `{scope}`) whose schema has a `spec.{spec_field}` field of type `{spec_type}`. Then "
+        f"create a `{kind}` instance named `{instance_name}`"
+        + (f" in namespace `{instance_ns}`" if instance_ns else "")
+        + f" with spec.{spec_field} = `{instance_value}`."
+    )
+    r = RenderResult(
+        archetype_id=q.archetype_id,
+        question_index=0,
+        task=task,
+        setup_manifests=[_namespace_doc(instance_ns)] if instance_ns else [],
+    )
+    r.assertions = [
+        ResourceAssertion("customresourcedefinitions.apiextensions.k8s.io", crd_name),
+        ResourceAssertion("customresourcedefinitions.apiextensions.k8s.io", crd_name, None, "{.spec.group}", group),
+        ResourceAssertion("customresourcedefinitions.apiextensions.k8s.io", crd_name, None, "{.spec.names.kind}", kind),
+        ResourceAssertion("customresourcedefinitions.apiextensions.k8s.io", crd_name, None, "{.spec.names.plural}", plural),
+        ResourceAssertion("customresourcedefinitions.apiextensions.k8s.io", crd_name, None, "{.spec.versions[0].name}", version),
+        ResourceAssertion("customresourcedefinitions.apiextensions.k8s.io", crd_name, None, "{.spec.scope}", scope),
+        ResourceAssertion(f"{plural}.{group}", instance_name, instance_ns),
+        ResourceAssertion(f"{plural}.{group}", instance_name, instance_ns, f"{{.spec.{spec_field}}}", instance_value),
+    ]
+    r.reference_manifests = [crd_doc, instance_doc]
+    return r
+
+
+def render_operator(q: QuestionSpec) -> RenderResult:
+    p = q.params
+    namespace = p["namespace"]
+    cert_name = p["cert_name"]
+    issuer_name = p["issuer_name"]
+    host = p["host"]
+    # Pinned official cert-manager static install manifest.
+    cert_manager_url = (
+        "https://github.com/cert-manager/cert-manager/releases/download/"
+        "v1.21.1/cert-manager.yaml"
+    )
+
+    task = (
+        f"cert-manager is NOT installed. Install it with:\n"
+        f"    kubectl apply -f {cert_manager_url}\n"
+        f"Then create a self-signed `Issuer` named `{issuer_name}` in namespace `{namespace}` and a "
+        f"`Certificate` named `{cert_name}` for host `{host}`. The Certificate must become Ready "
+        f"and produce a TLS Secret."
+    )
+    r = RenderResult(
+        archetype_id=q.archetype_id,
+        question_index=0,
+        task=task,
+        setup_manifests=[_namespace_doc(namespace)],
+        reference_install_commands=[["apply", "-f", cert_manager_url]],
+        reference_ready_assertions=[
+            ResourceAssertion("deployments.apps", "cert-manager-webhook", "cert-manager", "{.status.availableReplicas}", 1, "gte"),
+            ResourceAssertion("deployments.apps", "cert-manager", "cert-manager", "{.status.availableReplicas}", 1, "gte"),
+        ],
+        reference_teardown_commands=[
+            ["delete", "certificates.cert-manager.io", cert_name, "-n", namespace, "--ignore-not-found"],
+            ["delete", "issuers.cert-manager.io", issuer_name, "-n", namespace, "--ignore-not-found"],
+            ["delete", "ns", "cert-manager", "--ignore-not-found"],
+            ["delete", "validatingwebhookconfiguration", "cert-manager-webhook", "--ignore-not-found"],
+            ["delete", "mutatingwebhookconfiguration", "cert-manager-webhook", "--ignore-not-found"],
+            ["delete", "crd",
+             "certificates.cert-manager.io", "issuers.cert-manager.io", "clusterissuers.cert-manager.io",
+             "certificaterequests.cert-manager.io", "orders.acme.cert-manager.io", "challenges.acme.cert-manager.io",
+             "--ignore-not-found"],
+        ],
+    )
+    r.reference_manifests = [
+        {
+            "apiVersion": "cert-manager.io/v1",
+            "kind": "Issuer",
+            "metadata": {"name": issuer_name, "namespace": namespace},
+            "spec": {"selfSigned": {}},
+        },
+        {
+            "apiVersion": "cert-manager.io/v1",
+            "kind": "Certificate",
+            "metadata": {"name": cert_name, "namespace": namespace},
+            "spec": {
+                "secretName": cert_name,
+                "issuerRef": {"name": issuer_name, "kind": "Issuer"},
+                "dnsNames": [host],
+            },
+        },
+    ]
+    r.assertions = [
+        ResourceAssertion("issuers.cert-manager.io", issuer_name, namespace),
+        ResourceAssertion(
+            "issuers.cert-manager.io", issuer_name, namespace,
+            '{.status.conditions[?(@.type=="Ready")].status}', "True",
+        ),
+        ResourceAssertion("certificates.cert-manager.io", cert_name, namespace),
+        ResourceAssertion(
+            "certificates.cert-manager.io", cert_name, namespace,
+            '{.status.conditions[?(@.type=="Ready")].status}', "True",
+        ),
+        ResourceAssertion("secrets", cert_name, namespace),
+    ]
+    return r
+
+
+def render_gateway(q: QuestionSpec) -> RenderResult:
+    p = q.params
+    namespace = p["namespace"]
+    name = p["name"]
+    host = p["host"]
+    port = p.get("port", 80)
+    replicas = p.get("replicas", 1)
+    labels = p["labels"]
+    svc_name = f"{name}-backend-svc"
+    deploy_name = f"{name}-backend"
+    gateway_class = "example"
+    # Contour is installed in gateway-ref mode: it serves the fixed `contour`
+    # Gateway in the `projectcontour` namespace (created by the install).
+    gateway_name = "contour"
+    gateway_namespace = "projectcontour"
+    # Pinned official Contour Gateway API install (single manifest).
+    contour_url = (
+        "https://raw.githubusercontent.com/projectcontour/contour/v1.33.6/"
+        "examples/render/contour-gateway.yaml"
+    )
+
+    task = (
+        f"The Gateway API is NOT installed. Install it with:\n"
+        f"    kubectl apply -f {contour_url}\n"
+        f"(if it reports 'resource mapping not found ... ensure CRDs are installed first', "
+        f"simply run the apply again — the first pass registers the CRDs.)\n"
+        f"This installs the Gateway API CRDs, the Contour controller, the Envoy data plane, a "
+        f"GatewayClass `{gateway_class}`, and a Gateway `{gateway_name}` in namespace "
+        f"`{gateway_namespace}`. Then create an HTTPRoute named `{name}` in namespace "
+        f"`{namespace}` attached to the `{gateway_name}` Gateway, routing host `{host}` to "
+        f"Service `{svc_name}` on port {port}."
+    )
+    r = RenderResult(
+        archetype_id=q.archetype_id,
+        question_index=0,
+        task=task,
+        setup_manifests=[
+            _namespace_doc(namespace),
+            _deployment_doc(deploy_name, namespace, "nginx:1.27", replicas, labels, container_port=80),
+            _service_doc(svc_name, namespace, "ClusterIP", port, 80, labels),
+        ],
+        reference_install_commands=[
+            ["apply", "-f", contour_url],
+        ],
+        reference_ready_assertions=[
+            ResourceAssertion("deployments.apps", "contour", "projectcontour", "{.status.availableReplicas}", 1, "gte"),
+        ],
+        reference_teardown_commands=[
+            ["delete", "httproutes.gateway.networking.k8s.io", name, "-n", namespace, "--ignore-not-found"],
+            ["delete", "gatewayclasses.gateway.networking.k8s.io", gateway_class, "--ignore-not-found"],
+            ["delete", "ns", "projectcontour", "--ignore-not-found"],
+            ["delete", "crd",
+             "gateways.gateway.networking.k8s.io", "gatewayclasses.gateway.networking.k8s.io",
+             "httproutes.gateway.networking.k8s.io", "referencegrants.gateway.networking.k8s.io",
+             "--ignore-not-found"],
+        ],
+    )
+    httproute_doc = {
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "kind": "HTTPRoute",
+        "metadata": {"name": name, "namespace": namespace},
+        "spec": {
+            "parentRefs": [{"name": gateway_name, "namespace": gateway_namespace}],
+            "hostnames": [host],
+            "rules": [{"backendRefs": [{"name": svc_name, "port": port}]}],
+        },
+    }
+    r.assertions = [
+        ResourceAssertion("customresourcedefinitions.apiextensions.k8s.io", "gatewayclasses.gateway.networking.k8s.io"),
+        ResourceAssertion("customresourcedefinitions.apiextensions.k8s.io", "httproutes.gateway.networking.k8s.io"),
+        ResourceAssertion("gatewayclasses.gateway.networking.k8s.io", gateway_class),
+        ResourceAssertion(
+            "gatewayclasses.gateway.networking.k8s.io", gateway_class, None,
+            "{.spec.controllerName}", "projectcontour.io/gateway-controller",
+        ),
+        ResourceAssertion("gateways.gateway.networking.k8s.io", gateway_name, gateway_namespace),
+        ResourceAssertion(
+            "gateways.gateway.networking.k8s.io", gateway_name, gateway_namespace,
+            '{.status.conditions[?(@.type=="Accepted")].status}', "True",
+        ),
+        ResourceAssertion(
+            "gateways.gateway.networking.k8s.io", gateway_name, gateway_namespace,
+            '{.status.conditions[?(@.type=="Programmed")].status}', "True",
+        ),
+        ResourceAssertion("httproutes.gateway.networking.k8s.io", name, namespace),
+        ResourceAssertion("httproutes.gateway.networking.k8s.io", name, namespace, "{.spec.hostnames[0]}", host),
+        ResourceAssertion(
+            "httproutes.gateway.networking.k8s.io", name, namespace,
+            "{.spec.rules[0].backendRefs[0].name}", svc_name,
+        ),
+        ResourceAssertion(
+            "httproutes.gateway.networking.k8s.io", name, namespace,
+            "{.spec.rules[0].backendRefs[0].port}", port,
+        ),
+        ResourceAssertion(
+            "httproutes.gateway.networking.k8s.io", name, namespace,
+            "{.spec.parentRefs[0].name}", gateway_name,
+        ),
+    ]
+    r.reference_manifests = [httproute_doc]
+    return r
+
+
 RENDERERS = {
     "deployment": render_deployment,
     "service": render_service,
@@ -1088,6 +1362,9 @@ RENDERERS = {
     "kustomize": render_kustomize,
     "ingress": render_ingress,
     "ingress_multi": render_ingress_multi,
+    "crd": render_crd,
+    "operator": render_operator,
+    "gateway": render_gateway,
 }
 
 

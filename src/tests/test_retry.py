@@ -143,6 +143,7 @@ def test_setup_questions_repairs_failing_question_in_place(monkeypatch, tmp_path
         provider=object(),
         kubectl=object(),
         node_name="minikube",
+        files_dir=tmp_path,
         log=log_lines.append,
     )
     assert repaired == [0]
@@ -154,7 +155,7 @@ def test_setup_questions_repairs_failing_question_in_place(monkeypatch, tmp_path
     assert any("regenerating just this challenge" in line for line in log_lines)
 
 
-def test_setup_questions_gives_up_after_repair_attempts(monkeypatch):
+def test_setup_questions_gives_up_after_repair_attempts(monkeypatch, tmp_path):
     import cka_mock.exam as exam_mod
     from cka_mock.renderer import render_exam
 
@@ -190,5 +191,6 @@ def test_setup_questions_gives_up_after_repair_attempts(monkeypatch):
             provider=object(),
             kubectl=object(),
             node_name="minikube",
+            files_dir=tmp_path,
             log=lambda _m: None,
         )

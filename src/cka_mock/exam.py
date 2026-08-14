@@ -113,7 +113,7 @@ def _cleanup_failed_exam(exam_dir: Path) -> None:
         shutil.rmtree(exam_dir, ignore_errors=True)
 
 
-def _cleanup_question_setup(kubectl, result) -> None:
+def _cleanup_question_setup(kubectl, result, files_dir: Path | None = None) -> None:
     """Best-effort removal of a replaced question's setup artifacts.
 
     Namespaces are left in place (they may be shared with other questions and
@@ -185,8 +185,9 @@ def _run_exam_flow(cfg, plan, results, workdir, exam_dir, *, raw, provider=None)
         console.print("[yellow]warn[/yellow] this exam includes a Helm challenge but `helm` is not on PATH")
 
     console.print(f"[bold]Cluster ready[/bold] (node {node_name}). Setting up challenges...")
+    files_dir = exam_dir / "files"
     preflight_warnings, repaired = _setup_questions(
-        cfg, plan, results, provider, kubectl, node_name, log=console.print
+        cfg, plan, results, provider, kubectl, node_name, files_dir, log=console.print
     )
 
     if repaired:
@@ -216,7 +217,9 @@ def _run_exam_flow(cfg, plan, results, workdir, exam_dir, *, raw, provider=None)
     return 0
 
 
-def _setup_questions(cfg, plan, results, provider, kubectl, node_name, *, log) -> tuple[list[str], list[int]]:
+def _setup_questions(
+    cfg, plan, results, provider, kubectl, node_name, files_dir, *, log
+) -> tuple[list[str], list[int]]:
     """Apply setup and preflight each question, repairing failures in place.
 
     When a question fails preflight and an LLM provider is available, that one
@@ -232,12 +235,12 @@ def _setup_questions(cfg, plan, results, provider, kubectl, node_name, *, log) -
         while True:
             log(f"  Q{result.question_index}: {result.archetype_id} ...")
             skip_kinds = {"Deployment"} if result.archetype_id == "troubleshooting_crashloop" else None
-            apply_result_setup(kubectl, result, node_name)
+            apply_result_setup(kubectl, result, node_name, files_dir)
             setup_warnings = wait_for_manifests(kubectl, result.setup_manifests, skip_kinds=skip_kinds)
             for warning in setup_warnings:
                 log(f"    [yellow]warn[/yellow] Q{result.question_index}: {warning}")
             try:
-                report = preflight_result(kubectl, result, node_name)
+                report = preflight_result(kubectl, result, node_name, files_dir=files_dir)
                 break
             except PreflightError as exc:
                 if repairs_left <= 0:
@@ -260,7 +263,8 @@ def _setup_questions(cfg, plan, results, provider, kubectl, node_name, *, log) -
                 plan.questions[index] = replacement
                 repaired_this_question = True
                 new_result = _render_single(replacement, index + 1)
-                _cleanup_question_setup(kubectl, result)
+                _cleanup_question_setup(kubectl, result, files_dir)
+                _write_result_files(files_dir, new_result)
                 results[index] = new_result
                 result = new_result
         preflight_warnings.extend(report.warnings)
@@ -284,10 +288,14 @@ def _render_single(question, question_index: int):
 def _write_exam_files(exam_dir: Path, results) -> None:
     files_dir = exam_dir / "files"
     for result in results:
-        for exam_file in result.files:
-            target = files_dir / exam_file.path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(exam_file.content)
+        _write_result_files(files_dir, result)
+
+
+def _write_result_files(files_dir: Path, result) -> None:
+    for exam_file in result.files:
+        target = files_dir / exam_file.path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(exam_file.content)
 
 
 def run_grade(cfg: Config) -> int:

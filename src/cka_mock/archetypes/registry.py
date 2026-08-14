@@ -11,6 +11,7 @@ Phase 3 and the full catalog in Phase 5.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Callable
 
@@ -31,10 +32,11 @@ DOMAINS: dict[str, int] = {
 }
 
 # Archetype families: questions in the same family share cluster-level resources
-# (e.g. the ingress controller routes by Host, so two questions sharing a host
-# would conflict). The generator caps how many questions one family may produce.
+# (e.g. the ingress/gateway controllers route by Host, so two questions sharing a
+# host would conflict). The generator caps how many questions one family may produce.
 FAMILIES: dict[str, tuple[str, ...]] = {
     "ingress": ("ingress", "ingress_multi"),
+    "gateway": ("gateway",),
 }
 
 
@@ -294,6 +296,16 @@ def _host_schema() -> dict:
     }
 
 
+def _group_schema() -> dict:
+    # A CRD group is a DNS domain with at least one dot (e.g. example.com).
+    return {
+        "type": "string",
+        "pattern": r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)+$",
+        "minLength": 5,
+        "maxLength": 253,
+    }
+
+
 _register(Archetype(
     id="configmap_secret",
     domain="Workloads & Scheduling",
@@ -513,6 +525,101 @@ _register(Archetype(
         "additionalProperties": False,
     },
 ))
+
+
+_register(Archetype(
+    id="crd",
+    domain="Cluster Architecture, Installation & Configuration",
+    competency="Understand CRDs, install and configure operators",
+    title="Create a CustomResourceDefinition and an instance",
+    description=(
+        "Create a CRD for a custom resource (group/version/kind/plural) with a simple spec "
+        "schema, then create an instance of it with a given spec value."
+    ),
+    topics=("crd", "customresource", "operators"),
+    params_schema={
+        "type": "object",
+        "required": [
+            "plural", "singular", "group", "version", "kind", "scope",
+            "spec_field", "spec_type", "instance_name", "instance_namespace", "instance_value",
+        ],
+        "properties": {
+            "plural": {"type": "string", "pattern": r"^[a-z][a-z0-9]*$", "minLength": 2},
+            "singular": {"type": "string", "pattern": r"^[a-z][a-z0-9]*$", "minLength": 2},
+            "group": _group_schema(),
+            "version": {"type": "string", "pattern": r"^v\d+(alpha\d+|beta\d+)?$"},
+            "kind": {"type": "string", "pattern": r"^[A-Z][A-Za-z0-9]*$"},
+            "scope": {"type": "string", "enum": ["Namespaced", "Cluster"]},
+            "spec_field": {"type": "string", "pattern": r"^[a-z][a-zA-Z0-9]*$"},
+            "spec_type": {"type": "string", "enum": ["string", "integer", "boolean"]},
+            "instance_name": name_schema(),
+            "instance_namespace": name_schema(),
+            "instance_value": {"type": "string", "minLength": 1, "maxLength": 200},
+        },
+        "additionalProperties": False,
+    },
+    extra_checks=lambda p: _crd_value_checks(p),
+))
+
+_register(Archetype(
+    id="operator",
+    domain="Cluster Architecture, Installation & Configuration",
+    competency="Understand CRDs, install and configure operators",
+    title="Install cert-manager and configure a Certificate",
+    description=(
+        "cert-manager is NOT installed. Install it from the provided manifest, then create a "
+        "self-signed Issuer and a Certificate that must become Ready and produce a TLS Secret."
+    ),
+    topics=("operator", "cert-manager", "certificates", "crd"),
+    params_schema={
+        "type": "object",
+        "required": ["cert_name", "namespace", "issuer_name", "host"],
+        "properties": {
+            "cert_name": name_schema(),
+            "namespace": name_schema(),
+            "issuer_name": name_schema(),
+            "host": _host_schema(),
+        },
+        "additionalProperties": False,
+    },
+))
+
+_register(Archetype(
+    id="gateway",
+    domain="Services & Networking",
+    competency="Use the Gateway API to manage Ingress traffic",
+    title="Install the Gateway API and route traffic with an HTTPRoute",
+    description=(
+        "The Gateway API is NOT installed. Install it from the official Contour manifest "
+        "(a URL is provided in the task), then create an HTTPRoute routing a host to a "
+        "Service through the installed Gateway."
+    ),
+    topics=("gateway", "gatewayapi", "httproute", "networking"),
+    params_schema={
+        "type": "object",
+        "required": ["name", "namespace", "host", "labels"],
+        "properties": {
+            "name": name_schema(),
+            "namespace": name_schema(),
+            "host": _host_schema(),
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535, "default": 80},
+            "replicas": {"type": "integer", "minimum": 1, "maximum": 5},
+            "labels": label_schema(),
+        },
+        "additionalProperties": False,
+    },
+))
+
+
+def _crd_value_checks(params: dict) -> list[str]:
+    spec_type = params.get("spec_type")
+    value = params.get("instance_value")
+    errors = []
+    if spec_type == "integer" and not re.fullmatch(r"\d+", value or ""):
+        errors.append(f"instance_value must be an integer for spec_type 'integer', got {value!r}")
+    if spec_type == "boolean" and (value or "") not in ("true", "false"):
+        errors.append(f"instance_value must be 'true' or 'false' for spec_type 'boolean', got {value!r}")
+    return errors
 
 
 def summarize_schema(schema: dict) -> str:

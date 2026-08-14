@@ -123,3 +123,79 @@ def test_preflight_restores_fix_archetype(fake_tooling):
     result = RENDERERS["troubleshooting_crashloop"](spec)
     with pytest.raises(PreflightError, match="reference solution"):
         preflight_result(Kubectl(), result, node_name="minikube", satisfied_timeout=6)
+
+
+def test_preflight_install_yourself_flow(fake_tooling, tmp_path):
+    """Install-yourself archetypes: install -> ready -> reference -> teardown."""
+    state = {"solved": False}
+    gateway_host = "gw.example.com"
+    svc_name = "web-route-backend-svc"
+
+    @fake_tooling.when("kubectl", "apply")
+    def apply(argv):
+        # reference manifests come via stdin; install commands reference a file path
+        if "-" in argv:
+            state["solved"] = True
+        return subprocess.CompletedProcess(argv, 0, "applied", "")
+
+    @fake_tooling.when("kubectl", "delete")
+    def delete(argv):
+        state["solved"] = False
+        return subprocess.CompletedProcess(argv, 0, "deleted", "")
+
+    @fake_tooling.when("kubectl", "get", "deployments.apps")
+    def get_deploy(argv):
+        return subprocess.CompletedProcess(argv, 0, "1", "")
+
+    @fake_tooling.when("kubectl", "get", "gatewayclasses.gateway.networking.k8s.io")
+    def get_gc(argv):
+        if not state["solved"]:
+            return subprocess.CompletedProcess(argv, 1, "", "NotFound")
+        if "-o" in argv:
+            path = argv[argv.index("-o") + 1].split("jsonpath=", 1)[1]
+            value = "projectcontour.io/gateway-controller" if "controllerName" in path else ""
+            return subprocess.CompletedProcess(argv, 0, value, "")
+        return subprocess.CompletedProcess(argv, 0, "contour", "")
+
+    @fake_tooling.when("kubectl", "get", "gateways.gateway.networking.k8s.io")
+    def get_gw(argv):
+        if not state["solved"]:
+            return subprocess.CompletedProcess(argv, 1, "", "NotFound")
+        if "-o" in argv:
+            path = argv[argv.index("-o") + 1].split("jsonpath=", 1)[1]
+            return subprocess.CompletedProcess(argv, 0, "True" if "status" in path else "", "")
+        return subprocess.CompletedProcess(argv, 0, "contour", "")
+
+    @fake_tooling.when("kubectl", "get", "httproutes.gateway.networking.k8s.io")
+    def get_hr(argv):
+        if not state["solved"]:
+            return subprocess.CompletedProcess(argv, 1, "", "NotFound")
+        if "-o" in argv:
+            path = argv[argv.index("-o") + 1].split("jsonpath=", 1)[1]
+            value = {
+                "{.spec.hostnames[0]}": gateway_host,
+                "{.spec.rules[0].backendRefs[0].name}": svc_name,
+                "{.spec.rules[0].backendRefs[0].port}": "80",
+                "{.spec.parentRefs[0].name}": "contour",
+            }.get(path, "")
+            return subprocess.CompletedProcess(argv, 0, value, "")
+        return subprocess.CompletedProcess(argv, 0, "web-route", "")
+
+    @fake_tooling.when("kubectl", "get", "customresourcedefinitions.apiextensions.k8s.io")
+    def get_crd(argv):
+        if state["solved"]:
+            return subprocess.CompletedProcess(argv, 0, "crd", "")
+        return subprocess.CompletedProcess(argv, 1, "", "NotFound")
+
+    result = RENDERERS["gateway"](QuestionSpec("gateway", {
+        "name": "web-route", "namespace": "gwapp", "host": gateway_host,
+        "labels": {"app": "web"}, "port": 80, "replicas": 1,
+    }))
+    report = preflight_result(Kubectl(), result, node_name="minikube", files_dir=tmp_path)
+    assert not report.warnings
+    # teardown left the cluster unsolved
+    assert state["solved"] is False
+    delete_calls = [c for c in fake_tooling.calls if c[:2] == ["kubectl", "delete"]]
+    assert delete_calls, "teardown commands must run"
+    install_calls = [c for c in fake_tooling.calls if c[:2] == ["kubectl", "apply"]]
+    assert any(c[2] == "-f" and c[3] != "-" for c in install_calls), "install commands must run"

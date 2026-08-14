@@ -22,12 +22,18 @@ SRC = ROOT / "src"
 sys.path.insert(0, str(SRC))
 
 from cka_mock.env import MinikubeEnv
+from cka_mock.exam import _write_exam_files
 from cka_mock.generation import generate_exam_plan
 from cka_mock.grader import grade_exam
-from cka_mock.preflight import PreflightError, _wait_satisfied, preflight_result
+from cka_mock.preflight import PreflightError, _wait_ready, _wait_satisfied, preflight_result
 from cka_mock.providers import StaticProvider
 from cka_mock.renderer import render_exam
-from cka_mock.setup import apply_reference, apply_result_setup, wait_for_manifests
+from cka_mock.setup import (
+    apply_install_commands,
+    apply_reference,
+    apply_result_setup,
+    wait_for_manifests,
+)
 from cka_mock.workdir import Workdir
 
 PAYLOAD = {
@@ -209,6 +215,42 @@ PAYLOAD = {
                 "port": 80,
             },
         },
+        {
+            "archetype": "crd",
+            "params": {
+                "plural": "widgets",
+                "singular": "widget",
+                "group": "example.com",
+                "version": "v1",
+                "kind": "Widget",
+                "scope": "Namespaced",
+                "spec_field": "size",
+                "spec_type": "string",
+                "instance_name": "widget-one",
+                "instance_namespace": "widgets",
+                "instance_value": "large",
+            },
+        },
+        {
+            "archetype": "operator",
+            "params": {
+                "cert_name": "web-cert",
+                "namespace": "certapp",
+                "issuer_name": "self-issuer",
+                "host": "cert.example.com",
+            },
+        },
+        {
+            "archetype": "gateway",
+            "params": {
+                "name": "web-route",
+                "namespace": "gwapp",
+                "host": "gw.example.com",
+                "labels": {"app": "web"},
+                "port": 80,
+                "replicas": 1,
+            },
+        },
     ]
 }
 
@@ -232,15 +274,17 @@ def main() -> int:
     kubectl = env.kubectl(kubeconfig)
     node_name = env.node_name(kubectl)
     wd.save_plan(exam_dir, plan)
+    _write_exam_files(exam_dir, results)
+    files_dir = exam_dir / "files"
 
     for result in results:
         print(f"--- setup Q{result.question_index} ({result.archetype_id}) ---")
         skip = {"Deployment"} if result.archetype_id == "troubleshooting_crashloop" else None
-        apply_result_setup(kubectl, result, node_name)
+        apply_result_setup(kubectl, result, node_name, files_dir)
         for warning in wait_for_manifests(kubectl, result.setup_manifests, skip_kinds=skip):
             print("  setup warn:", warning)
         try:
-            report = preflight_result(kubectl, result, node_name)
+            report = preflight_result(kubectl, result, node_name, files_dir=files_dir)
         except PreflightError as exc:
             print(f"  PREFLIGHT FAILED: {exc}")
             env.delete()
@@ -251,7 +295,13 @@ def main() -> int:
 
     print("\n=== simulating the user solving via reference solutions ===")
     for result in results:
-        apply_reference(kubectl, result, node_name)
+        apply_install_commands(kubectl, result, node_name, files_dir)
+        if result.reference_ready_assertions:
+            if not _wait_ready(kubectl, result.reference_ready_assertions, timeout=360):
+                print(f"  Q{result.question_index} ({result.archetype_id}) install never ready")
+                env.delete()
+                return 1
+        apply_reference(kubectl, result, node_name, files_dir)
         wait_for_manifests(kubectl, result.reference_manifests, timeout=240)
         if not _wait_satisfied(kubectl, result, timeout=150):
             print(f"  Q{result.question_index} ({result.archetype_id}) never satisfied")

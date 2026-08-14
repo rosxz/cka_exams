@@ -60,12 +60,21 @@ Archetypes currently supported: deployment, service, pvc, networkpolicy (behavio
 probes), rbac, scheduling (nodeSelector + limits), troubleshooting_crashloop,
 configmap_secret, fix_served_file, cni_config, autoscaling (HPA), helm, kustomize,
 ingress, ingress_multi (host-based routing, behaviorally verified through the
-ingress-nginx controller).
+ingress-nginx controller), crd (create a CRD + instance), operator (install
+cert-manager yourself, then issue a Certificate), gateway (install the Gateway API
++ Contour yourself, then create a GatewayClass + HTTPRoute).
 
 Workload archetypes whose Deployments must become Ready only allow long-running
 images (nginx/redis/httpd/memcached); crash-loop troubleshooting is restricted to
 HTTP-serving images, so the generated reference solutions can never CrashLoop from
 an image that exits immediately (e.g. busybox/alpine/python).
+
+Install-yourself archetypes (`operator`, `gateway`) mirror the real CKA: nothing is
+pre-installed. Both install from the **official pinned upstream URL** given in the task
+(cert-manager `v1.21.1`, Contour `v1.33.6`); the tool's preflight does the same install,
+verifies, then tears everything down so the candidate starts clean. For manifests whose
+resources depend on CRDs created by the same file (Contour), apply twice if the first
+pass reports a CRD-establishment race — the tool's preflight retries automatically.
 
 Planned:
 
