@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import shutil
+
 from cka_mock.config import Config
-from cka_mock.exam import _cleanup_question_setup, _needed_addons
+from cka_mock.exam import _cleanup_question_setup, _needed_addons, run_reset
 from cka_mock.renderer import RENDERERS, render_exam
 from cka_mock.schemas import ExamPlan, QuestionSpec
+from cka_mock.workdir import Workdir
 
 
 def test_needed_addons_adds_ingress_when_present():
@@ -98,3 +101,21 @@ def test_cleanup_question_setup_skips_namespace(fake_tooling):
     delete_calls = [call for call in fake_tooling.calls if call[:2] == ["kubectl", "delete"]]
     # namespace is left in place; only the backend Deployment is removed
     assert len(delete_calls) == 1
+
+
+def test_reset_keeps_exam_history(fake_tooling, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        shutil, "which",
+        lambda name: f"/usr/bin/{name}" if name in ("minikube", "kubectl") else None,
+    )
+    fake_tooling.respond("minikube", "-p", "cka-exam", "delete")
+
+    workdir = Workdir(tmp_path)
+    exam_dir = workdir.new_exam()
+    workdir.save_plan(exam_dir, ExamPlan(questions=[QuestionSpec("deployment", {"name": "web", "namespace": "app"})]))
+
+    cfg = Config(workdir_root=tmp_path, minikube_profile="cka-exam")
+    run_reset(cfg)
+
+    assert (exam_dir / "exam.json").is_file()
+    assert workdir.active() == exam_dir

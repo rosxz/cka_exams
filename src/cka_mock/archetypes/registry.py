@@ -590,9 +590,9 @@ _register(Archetype(
     competency="Use the Gateway API to manage Ingress traffic",
     title="Install the Gateway API and route traffic with an HTTPRoute",
     description=(
-        "The Gateway API is NOT installed. Install it from the official Contour manifest "
-        "(a URL is provided in the task), then create an HTTPRoute routing a host to a "
-        "Service through the installed Gateway."
+        "The Gateway API is NOT installed. Install it from a manifest provided as a local file "
+        "in the exam workdir (Contour), create a GatewayClass, and an HTTPRoute routing a host "
+        "to a Service through the installed Gateway."
     ),
     topics=("gateway", "gatewayapi", "httproute", "networking"),
     params_schema={

@@ -340,9 +340,8 @@ def test_operator_renderer_install_yourself():
     from cka_mock.assertion import ResourceAssertion
 
     result = RENDERERS["operator"](_spec("operator"))
-    assert result.files == []  # installs from the official cert-manager URL
-    assert len(result.reference_install_commands) == 1
-    assert "github.com/cert-manager/cert-manager/releases/download" in result.reference_install_commands[0][-1]
+    assert any(f.path == "cert-manager/install.yaml" for f in result.files)
+    assert result.reference_install_commands == [["apply", "-f", "{{FILES}}/cert-manager/install.yaml"]]
     assert len(result.reference_teardown_commands) == 6
     kinds = [d["kind"] for d in result.reference_manifests]
     assert kinds == ["Issuer", "Certificate"]
@@ -353,13 +352,14 @@ def test_gateway_renderer_contour_model():
     from cka_mock.assertion import ResourceAssertion
 
     result = RENDERERS["gateway"](_spec("gateway"))
-    assert result.files == []  # installs from the official URL, no vendored file
-    assert len(result.reference_install_commands) == 1
-    assert "raw.githubusercontent.com/projectcontour/contour" in result.reference_install_commands[0][-1]
+    assert any(f.path == "gateway/contour-gateway.yaml" for f in result.files)
+    assert result.reference_install_commands == [["apply", "-f", "{{FILES}}/gateway/contour-gateway.yaml"]]
     assert len(result.reference_ready_assertions) == 1
     assert len(result.reference_teardown_commands) >= 4
-    # reference is the HTTPRoute attached to the fixed contour Gateway
-    (route,) = result.reference_manifests
+    # the rewritten manifest strips the shipped class; reference = GatewayClass + HTTPRoute
+    gc, route = result.reference_manifests
+    assert gc["kind"] == "GatewayClass"
+    assert gc["spec"]["controllerName"] == "projectcontour.io/gateway-controller"
     assert route["kind"] == "HTTPRoute"
     assert route["spec"]["parentRefs"] == [{"name": "contour", "namespace": "projectcontour"}]
     conditions = {

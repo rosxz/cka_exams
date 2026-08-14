@@ -21,7 +21,7 @@ on `PATH` — the devShell provides all of them.
 cka-mock new  [--topics RBAC Helm ...] [--questions N] [--duration M] [--difficulty easy|medium|hard]
 cka-mock grade
 cka-mock status
-cka-mock reset
+cka-mock reset              # delete the exam cluster only; exam history is kept
 cka-mock replay <exam-id>     # repeat a past exam as a fresh attempt (no LLM):
                               #   resets the cluster, re-applies the broken states,
                               #   serves the same questions again
@@ -70,11 +70,14 @@ HTTP-serving images, so the generated reference solutions can never CrashLoop fr
 an image that exits immediately (e.g. busybox/alpine/python).
 
 Install-yourself archetypes (`operator`, `gateway`) mirror the real CKA: nothing is
-pre-installed. Both install from the **official pinned upstream URL** given in the task
-(cert-manager `v1.21.1`, Contour `v1.33.6`); the tool's preflight does the same install,
-verifies, then tears everything down so the candidate starts clean. For manifests whose
-resources depend on CRDs created by the same file (Contour), apply twice if the first
-pass reports a CRD-establishment race — the tool's preflight retries automatically.
+pre-installed. The tool downloads the **pinned official manifest once** at exam
+generation (cached under `~/.cache/cka-mock/manifests/`), rewrites the Contour file so
+**you author the GatewayClass**, and places both as **local files in the exam workdir** —
+you apply them with `kubectl apply -f files/...`, exactly like the real (offline) exam.
+The tool's preflight does the same install, verifies, then tears everything down so you
+start clean. If a manifest's resources depend on CRDs created by the same file
+(Contour), apply twice if the first pass reports a CRD-establishment race — the tool's
+preflight retries automatically.
 
 Planned:
 

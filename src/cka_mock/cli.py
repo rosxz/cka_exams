@@ -29,7 +29,7 @@ def main(argv: list[str] | None = None) -> int:
     p_status = sub.add_parser("status", help="show exam timer and cluster context")
     p_status.add_argument("--config", help="path to config file")
 
-    p_reset = sub.add_parser("reset", help="delete the exam cluster and workdir")
+    p_reset = sub.add_parser("reset", help="delete the exam cluster (exam history is kept)")
     p_reset.add_argument("--config", help="path to config file")
 
     p_replay = sub.add_parser("replay", help="re-run a past exam deterministically (no LLM)")

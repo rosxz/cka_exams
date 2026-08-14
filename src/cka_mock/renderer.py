@@ -19,6 +19,7 @@ from .assertion import (
     ExecContentAssertion,
     ResourceAssertion,
 )
+from .manifests import fetch_manifest, rewrite_contour_manifest
 from .schemas import QuestionSpec
 
 NODE_TOKEN = "{{NODE}}"
@@ -1174,15 +1175,17 @@ def render_operator(q: QuestionSpec) -> RenderResult:
     cert_name = p["cert_name"]
     issuer_name = p["issuer_name"]
     host = p["host"]
-    # Pinned official cert-manager static install manifest.
+    # Pinned official cert-manager static install manifest (downloaded once,
+    # cached, and placed in the workdir as a local file).
     cert_manager_url = (
         "https://github.com/cert-manager/cert-manager/releases/download/"
         "v1.21.1/cert-manager.yaml"
     )
 
     task = (
-        f"cert-manager is NOT installed. Install it with:\n"
-        f"    kubectl apply -f {cert_manager_url}\n"
+        f"cert-manager is NOT installed. Install it from the provided local file "
+        f"`files/cert-manager/install.yaml`:\n"
+        f"    kubectl apply -f files/cert-manager/install.yaml\n"
         f"Then create a self-signed `Issuer` named `{issuer_name}` in namespace `{namespace}` and a "
         f"`Certificate` named `{cert_name}` for host `{host}`. The Certificate must become Ready "
         f"and produce a TLS Secret."
@@ -1192,7 +1195,8 @@ def render_operator(q: QuestionSpec) -> RenderResult:
         question_index=0,
         task=task,
         setup_manifests=[_namespace_doc(namespace)],
-        reference_install_commands=[["apply", "-f", cert_manager_url]],
+        files=[ExamFile(path="cert-manager/install.yaml", content=fetch_manifest(cert_manager_url))],
+        reference_install_commands=[["apply", "-f", f"{FILES_TOKEN}/cert-manager/install.yaml"]],
         reference_ready_assertions=[
             ResourceAssertion("deployments.apps", "cert-manager-webhook", "cert-manager", "{.status.availableReplicas}", 1, "gte"),
             ResourceAssertion("deployments.apps", "cert-manager", "cert-manager", "{.status.availableReplicas}", 1, "gte"),
@@ -1253,27 +1257,30 @@ def render_gateway(q: QuestionSpec) -> RenderResult:
     labels = p["labels"]
     svc_name = f"{name}-backend-svc"
     deploy_name = f"{name}-backend"
-    gateway_class = "example"
+    gateway_class = "contour"
     # Contour is installed in gateway-ref mode: it serves the fixed `contour`
     # Gateway in the `projectcontour` namespace (created by the install).
     gateway_name = "contour"
     gateway_namespace = "projectcontour"
-    # Pinned official Contour Gateway API install (single manifest).
+    # Pinned official Contour Gateway API install. The shipped `example`
+    # GatewayClass is stripped and the `contour` Gateway is repointed at the
+    # GatewayClass the candidate will create.
     contour_url = (
         "https://raw.githubusercontent.com/projectcontour/contour/v1.33.6/"
         "examples/render/contour-gateway.yaml"
     )
 
     task = (
-        f"The Gateway API is NOT installed. Install it with:\n"
-        f"    kubectl apply -f {contour_url}\n"
+        f"The Gateway API is NOT installed. Install it from the provided local file "
+        f"`files/gateway/contour-gateway.yaml`:\n"
+        f"    kubectl apply -f files/gateway/contour-gateway.yaml\n"
         f"(if it reports 'resource mapping not found ... ensure CRDs are installed first', "
         f"simply run the apply again — the first pass registers the CRDs.)\n"
-        f"This installs the Gateway API CRDs, the Contour controller, the Envoy data plane, a "
-        f"GatewayClass `{gateway_class}`, and a Gateway `{gateway_name}` in namespace "
-        f"`{gateway_namespace}`. Then create an HTTPRoute named `{name}` in namespace "
-        f"`{namespace}` attached to the `{gateway_name}` Gateway, routing host `{host}` to "
-        f"Service `{svc_name}` on port {port}."
+        f"This installs the Gateway API CRDs, the Contour controller, the Envoy data plane, and a "
+        f"Gateway `{gateway_name}` in namespace `{gateway_namespace}`. Then create a GatewayClass "
+        f"named `{gateway_class}` (controllerName `projectcontour.io/gateway-controller`) and an "
+        f"HTTPRoute named `{name}` in namespace `{namespace}` attached to the `{gateway_name}` "
+        f"Gateway, routing host `{host}` to Service `{svc_name}` on port {port}."
     )
     r = RenderResult(
         archetype_id=q.archetype_id,
@@ -1284,8 +1291,14 @@ def render_gateway(q: QuestionSpec) -> RenderResult:
             _deployment_doc(deploy_name, namespace, "nginx:1.27", replicas, labels, container_port=80),
             _service_doc(svc_name, namespace, "ClusterIP", port, 80, labels),
         ],
+        files=[
+            ExamFile(
+                path="gateway/contour-gateway.yaml",
+                content=rewrite_contour_manifest(fetch_manifest(contour_url), gateway_class),
+            ),
+        ],
         reference_install_commands=[
-            ["apply", "-f", contour_url],
+            ["apply", "-f", f"{FILES_TOKEN}/gateway/contour-gateway.yaml"],
         ],
         reference_ready_assertions=[
             ResourceAssertion("deployments.apps", "contour", "projectcontour", "{.status.availableReplicas}", 1, "gte"),
@@ -1300,6 +1313,12 @@ def render_gateway(q: QuestionSpec) -> RenderResult:
              "--ignore-not-found"],
         ],
     )
+    gatewayclass_doc = {
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "kind": "GatewayClass",
+        "metadata": {"name": gateway_class},
+        "spec": {"controllerName": "projectcontour.io/gateway-controller"},
+    }
     httproute_doc = {
         "apiVersion": "gateway.networking.k8s.io/v1",
         "kind": "HTTPRoute",
@@ -1342,7 +1361,7 @@ def render_gateway(q: QuestionSpec) -> RenderResult:
             "{.spec.parentRefs[0].name}", gateway_name,
         ),
     ]
-    r.reference_manifests = [httproute_doc]
+    r.reference_manifests = [gatewayclass_doc, httproute_doc]
     return r
 
 

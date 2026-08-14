@@ -80,3 +80,58 @@ def fake_which(monkeypatch):
         return fake_which
 
     return make_which
+
+
+# A minimal multi-doc stand-in for the downloaded Contour manifest, so renderer
+# tests never touch the network.
+SAMPLE_CONTOUR_MANIFEST = """\
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: projectcontour
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: example
+spec:
+  controllerName: projectcontour.io/gateway-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: contour
+  namespace: projectcontour
+spec:
+  gatewayClassName: example
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+    allowedRoutes:
+      namespaces:
+        from: All
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: contour
+  namespace: projectcontour
+spec:
+  template:
+    spec:
+      containers:
+      - name: contour
+        image: example/contour
+"""
+
+
+@pytest.fixture(autouse=True)
+def _no_network_manifest_fetch(monkeypatch):
+    """Renderer tests must not download manifests from the internet."""
+    import cka_mock.renderer as renderer_mod
+
+    monkeypatch.setattr(
+        renderer_mod, "fetch_manifest", lambda url: SAMPLE_CONTOUR_MANIFEST
+    )

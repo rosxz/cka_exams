@@ -323,9 +323,8 @@ def run_reset(cfg: Config) -> int:
     env = MinikubeEnv(profile=cfg.minikube_profile)
     console.print(f"Deleting minikube profile {cfg.minikube_profile} ...")
     env.delete()
-    if cfg.workdir_root.exists():
-        shutil.rmtree(cfg.workdir_root)
-    console.print("Reset complete.")
+    console.print("Reset complete. Exam history is kept (use `cka-mock list`); "
+                  "remove old exams manually under the workdir if desired.")
     return 0
 
 
