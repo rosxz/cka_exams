@@ -384,6 +384,55 @@ def test_ingress_backend_image_not_expected():
     assert validate_exam_payload({"questions": [q]}, REGISTRY) != []  # extra param rejected
 
 
+def test_fix_archetypes_require_distinct_broken_and_correct_values():
+    fix_deployment = {
+        "archetype": "fix_deployment",
+        "params": {
+            "name": "web", "namespace": "app", "image": "nginx:1.27", "replicas": 1,
+            "labels": {"app": "web"}, "wrong_image": "nginx:1.27",
+        },
+    }
+    assert validate_exam_payload({"questions": [fix_deployment]}, REGISTRY) != []
+
+    fix_configmap = {
+        "archetype": "fix_configmap",
+        "params": {
+            "name": "cfg", "namespace": "app", "deploy_name": "app", "image": "nginx:1.27",
+            "labels": {"app": "app"}, "replicas": 1, "env_key": "MODE",
+            "correct_value": "prod", "wrong_value": "prod",
+        },
+    }
+    assert validate_exam_payload({"questions": [fix_configmap]}, REGISTRY) != []
+
+    good = {
+        "archetype": "fix_deployment",
+        "params": {
+            "name": "web", "namespace": "app", "image": "nginx:1.27",
+            "wrong_image": "redis:7.2", "replicas": 1, "labels": {"app": "web"},
+        },
+    }
+    assert validate_exam_payload({"questions": [good]}, REGISTRY) == []
+
+
+def test_storage_class_must_be_unique_across_exam():
+    pvc = {
+        "archetype": "pvc",
+        "params": {
+            "name": "data", "namespace": "db", "access_mode": "ReadWriteOnce",
+            "size": "100Mi", "storage_class": "slow",
+        },
+    }
+    fix_pvc = {
+        "archetype": "fix_pvc",
+        "params": {
+            "name": "data2", "namespace": "db2", "access_mode": "ReadWriteOnce",
+            "size": "100Mi", "storage_class": "slow",
+        },
+    }
+    errors = validate_exam_payload({"questions": [pvc, fix_pvc]}, REGISTRY)
+    assert any("storage class" in e and "slow" in e for e in errors)
+
+
 def test_parse_json_strips_fences():
     assert parse_json('```json\n{"a": 1}\n```') == {"a": 1}
     assert parse_json('{"a": 1}') == {"a": 1}

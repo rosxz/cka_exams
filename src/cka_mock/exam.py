@@ -149,7 +149,7 @@ def _repair_question(provider, plan, failed_index: int, *, max_per_family: int):
     )
 
 
-_INGRESS_ARCHETYPES = ("ingress", "ingress_multi")
+_INGRESS_ARCHETYPES = ("ingress", "ingress_multi", "fix_ingress")
 
 
 def _needed_addons(cfg: Config, results) -> list[str]:

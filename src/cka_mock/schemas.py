@@ -167,6 +167,7 @@ def validate_exam_payload(payload: object, registry, max_per_family: int = 3) ->
     seen: set[tuple[str, str]] = set()
     family_counts: dict[str, int] = {}
     seen_hosts: set[str] = set()
+    seen_storage_classes: set[str] = set()
     result: list[str] = []
 
     for index, question in enumerate(questions, start=1):
@@ -196,6 +197,16 @@ def validate_exam_payload(payload: object, registry, max_per_family: int = 3) ->
             if host in seen_hosts:
                 result.append(f"question {index}: host {host!r} is used by another question")
             seen_hosts.add(host)
+
+        # StorageClasses are cluster-scoped; two questions referencing the same
+        # one would interfere (e.g. a fix_pvc becoming trivially solved).
+        storage_class = params.get("storage_class")
+        if isinstance(storage_class, str) and storage_class:
+            if storage_class in seen_storage_classes:
+                result.append(
+                    f"question {index}: storage class {storage_class!r} is used by another question"
+                )
+            seen_storage_classes.add(storage_class)
 
         name = params.get("name")
         namespace = params.get("namespace")

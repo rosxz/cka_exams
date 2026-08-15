@@ -1365,6 +1365,473 @@ def render_gateway(q: QuestionSpec) -> RenderResult:
     return r
 
 
+def render_fix_deployment(q: QuestionSpec) -> RenderResult:
+    p = q.params
+    labels = p["labels"]
+    broken = _deployment_doc(
+        p["name"], p["namespace"], p["wrong_image"], p["replicas"], labels,
+        container_port=p.get("container_port"),
+    )
+    fixed = _deployment_doc(
+        p["name"], p["namespace"], p["image"], p["replicas"], labels,
+        container_port=p.get("container_port"),
+    )
+    task = (
+        f"A Deployment named `{p['name']}` in namespace `{p['namespace']}` is running the wrong "
+        f"image. Fix it so it runs `{p['image']}` with {p['replicas']} replica(s) and pod labels "
+        f"{_labels_repr(labels)}, and all pods become Ready."
+    )
+    r = RenderResult(
+        archetype_id=q.archetype_id,
+        question_index=0,
+        task=task,
+        setup_manifests=[_namespace_doc(p["namespace"]), broken],
+    )
+    r.assertions = [
+        ResourceAssertion("deployments.apps", p["name"], p["namespace"]),
+        ResourceAssertion(
+            "deployments.apps", p["name"], p["namespace"],
+            "{.spec.template.spec.containers[0].image}", p["image"],
+        ),
+        ResourceAssertion("deployments.apps", p["name"], p["namespace"], "{.spec.replicas}", p["replicas"]),
+        ResourceAssertion(
+            "deployments.apps", p["name"], p["namespace"],
+            "{.spec.template.metadata.labels}", labels, "superset",
+        ),
+        ResourceAssertion(
+            "deployments.apps", p["name"], p["namespace"],
+            "{.status.availableReplicas}", p["replicas"], "gte",
+        ),
+    ]
+    r.reference_manifests = [fixed]
+    return r
+
+
+def render_fix_service(q: QuestionSpec) -> RenderResult:
+    p = q.params
+    backend = f"{p['name']}-backend"
+    labels = p["backend_labels"]
+    target_port = p["target_port"]
+    backend_image = p.get("backend_image", "nginx:1.27")
+    backend_replicas = p.get("backend_replicas", 1)
+    broken = _service_doc(p["name"], p["namespace"], p["service_type"], p["port"], target_port, p["wrong_labels"])
+    fixed = _service_doc(p["name"], p["namespace"], p["service_type"], p["port"], target_port, labels)
+    task = (
+        f"In namespace `{p['namespace']}`, a Service `{p['name']}` exists but its selector does "
+        f"not match the backend pods (labels {_labels_repr(labels)}), so it has no endpoints. "
+        f"Fix the Service selector so it routes to the backend (type `{p['service_type']}`, port "
+        f"{p['port']} -> {target_port})."
+    )
+    r = RenderResult(
+        archetype_id=q.archetype_id,
+        question_index=0,
+        task=task,
+        setup_manifests=[
+            _namespace_doc(p["namespace"]),
+            _deployment_doc(backend, p["namespace"], backend_image, backend_replicas, labels, container_port=target_port),
+            broken,
+        ],
+    )
+    r.assertions = [
+        ResourceAssertion("services", p["name"], p["namespace"]),
+        ResourceAssertion("services", p["name"], p["namespace"], "{.spec.type}", p["service_type"]),
+        ResourceAssertion("services", p["name"], p["namespace"], "{.spec.ports[0].port}", p["port"]),
+        ResourceAssertion("services", p["name"], p["namespace"], "{.spec.ports[0].targetPort}", target_port),
+        ResourceAssertion("services", p["name"], p["namespace"], "{.spec.selector}", labels, "eq"),
+        ResourceAssertion("endpoints", p["name"], p["namespace"], "{.subsets[0].addresses[*].ip}", op="nonempty"),
+    ]
+    r.reference_manifests = [fixed]
+    return r
+
+
+def render_fix_pvc(q: QuestionSpec) -> RenderResult:
+    p = q.params
+    namespace = p["namespace"]
+    name = p["name"]
+    storage_class = p["storage_class"]
+    broken = {
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {"name": name, "namespace": namespace},
+        "spec": {
+            "accessModes": [p["access_mode"]],
+            "storageClassName": storage_class,
+            "resources": {"requests": {"storage": p["size"]}},
+        },
+    }
+    fixed_sc = {
+        "apiVersion": "storage.k8s.io/v1",
+        "kind": "StorageClass",
+        "metadata": {"name": storage_class},
+        "provisioner": "k8s.io/minikube-hostpath",
+        "reclaimPolicy": "Delete",
+        "volumeBindingMode": "Immediate",
+    }
+    task = (
+        f"A PersistentVolumeClaim `{name}` in namespace `{namespace}` is stuck Pending because "
+        f"the StorageClass `{storage_class}` it references does not exist. Create the "
+        f"StorageClass `{storage_class}` (with a working provisioner) so the PVC binds "
+        f"(access mode `{p['access_mode']}`, {p['size']})."
+    )
+    r = RenderResult(
+        archetype_id=q.archetype_id,
+        question_index=0,
+        task=task,
+        setup_manifests=[_namespace_doc(namespace), broken],
+    )
+    r.assertions = [
+        ResourceAssertion("persistentvolumeclaims", name, namespace),
+        ResourceAssertion("persistentvolumeclaims", name, namespace, "{.spec.storageClassName}", storage_class),
+        ResourceAssertion("persistentvolumeclaims", name, namespace, "{.spec.accessModes[0]}", p["access_mode"]),
+        ResourceAssertion("persistentvolumeclaims", name, namespace, "{.status.phase}", "Bound"),
+        # The candidate's action is creating the missing StorageClass; checking it
+        # keeps the challenge "unsolved" after restore (deleting the SC), even
+        # though a bound PVC stays bound.
+        ResourceAssertion("storageclasses.storage.k8s.io", storage_class),
+    ]
+    r.reference_manifests = [fixed_sc]
+    return r
+
+
+def render_fix_networkpolicy(q: QuestionSpec) -> RenderResult:
+    p = q.params
+    name = p["name"]
+    namespace = p["namespace"]
+    port = p["port"]
+    protocol = p.get("protocol", "TCP")
+    target = f"{name}-target"
+    target_svc = f"{name}-svc"
+    peer = f"{name}-peer"
+    blocked = f"{name}-blocked"
+    target_labels = p["target_labels"]
+    peer_labels = p["peer_labels"]
+    blocked_labels = p["blocked_labels"]
+
+    def policy_doc(allowed_labels: dict) -> dict:
+        return {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {"name": name, "namespace": namespace},
+            "spec": {
+                "podSelector": {"matchLabels": target_labels},
+                "policyTypes": ["Ingress"],
+                "ingress": [
+                    {
+                        "from": [{"podSelector": {"matchLabels": allowed_labels}}],
+                        "ports": [{"protocol": protocol, "port": port}],
+                    }
+                ],
+            },
+        }
+
+    broken = policy_doc(blocked_labels)
+    fixed = policy_doc(peer_labels)
+    task = (
+        f"In namespace `{namespace}`, a NetworkPolicy `{name}` exists but is misconfigured: the "
+        f"client pod (labels {_labels_repr(peer_labels)}) cannot reach the target (labels "
+        f"{_labels_repr(target_labels)}) on port {port}/{protocol}, while a pod that must be "
+        f"denied can. Fix the policy so the peer can reach the target and the blocked pod cannot."
+    )
+    r = RenderResult(
+        archetype_id=q.archetype_id,
+        question_index=0,
+        task=task,
+        setup_manifests=[
+            _namespace_doc(namespace),
+            _deployment_doc(
+                target, namespace, "python:3.12-slim", 1, target_labels,
+                container_port=port,
+                command=["python3", "-m", "http.server", str(port)],
+            ),
+            _service_doc(target_svc, namespace, "ClusterIP", port, port, target_labels),
+            _pod_doc(peer, namespace, "busybox:1.36", peer_labels, ["sh", "-c", "sleep 3600"]),
+            _pod_doc(blocked, namespace, "busybox:1.36", blocked_labels, ["sh", "-c", "sleep 3600"]),
+            broken,
+        ],
+    )
+    probe = ["wget", "-qO-", "-T", "2", f"http://{target_svc}:{port}/"]
+    r.assertions = [
+        ResourceAssertion("networkpolicies.networking.k8s.io", name, namespace),
+        ExecAssertion(peer, namespace, probe, expect_rc=0),
+        ExecAssertion(blocked, namespace, probe, expect_rc=0, op="ne"),
+    ]
+    r.reference_manifests = [fixed]
+    return r
+
+
+def render_fix_scheduling(q: QuestionSpec) -> RenderResult:
+    p = q.params
+    labels = p["labels"]
+    correct_selector = {p["node_label_key"]: p["node_label_value"]}
+    wrong_selector = {"ckamock-nonexistent-key": "nowhere"}
+    broken = _deployment_doc(p["name"], p["namespace"], p["image"], p["replicas"], labels, container_port=80)
+    broken["spec"]["template"]["spec"]["nodeSelector"] = wrong_selector
+    fixed = _deployment_doc(p["name"], p["namespace"], p["image"], p["replicas"], labels, container_port=80)
+    fixed["spec"]["template"]["spec"]["nodeSelector"] = correct_selector
+    task = (
+        f"A Deployment `{p['name']}` in namespace `{p['namespace']}` is stuck Pending because its "
+        f"nodeSelector does not match the labeled node (`{p['node_label_key']}={p['node_label_value']}`). "
+        f"Fix the nodeSelector so the pods schedule and become Ready."
+    )
+    r = RenderResult(
+        archetype_id=q.archetype_id,
+        question_index=0,
+        task=task,
+        setup_manifests=[_namespace_doc(p["namespace"]), broken],
+        setup_commands=[["label", "nodes", NODE_TOKEN, f"{p['node_label_key']}={p['node_label_value']}"]],
+        node_required=True,
+    )
+    r.assertions = [
+        ResourceAssertion("deployments.apps", p["name"], p["namespace"]),
+        ResourceAssertion("deployments.apps", p["name"], p["namespace"], "{.spec.replicas}", p["replicas"]),
+        ResourceAssertion(
+            "deployments.apps", p["name"], p["namespace"],
+            "{.spec.template.spec.nodeSelector}", correct_selector, "eq",
+        ),
+        ResourceAssertion(
+            "deployments.apps", p["name"], p["namespace"],
+            "{.status.availableReplicas}", p["replicas"], "gte",
+        ),
+    ]
+    r.reference_manifests = [fixed]
+    return r
+
+
+def render_fix_configmap(q: QuestionSpec) -> RenderResult:
+    p = q.params
+    namespace = p["namespace"]
+    cm_name = p["name"]
+    deploy_name = p["deploy_name"]
+    labels = p["labels"]
+    env_key = p["env_key"]
+    broken_cm = {
+        "apiVersion": "v1", "kind": "ConfigMap",
+        "metadata": {"name": cm_name, "namespace": namespace},
+        "data": {env_key: p["wrong_value"]},
+    }
+    fixed_cm = {
+        "apiVersion": "v1", "kind": "ConfigMap",
+        "metadata": {"name": cm_name, "namespace": namespace},
+        "data": {env_key: p["correct_value"]},
+    }
+    deployment = _deployment_doc(deploy_name, namespace, p["image"], p["replicas"], labels, container_port=80)
+    deployment["spec"]["template"]["spec"]["containers"][0]["envFrom"] = [{"configMapRef": {"name": cm_name}}]
+    task = (
+        f"A Deployment `{deploy_name}` in namespace `{namespace}` reads configuration from "
+        f"ConfigMap `{cm_name}` (via envFrom). One value is wrong: key `{env_key}` should be "
+        f"`{p['correct_value']}`. Update the ConfigMap so it contains the correct value."
+    )
+    r = RenderResult(
+        archetype_id=q.archetype_id,
+        question_index=0,
+        task=task,
+        setup_manifests=[_namespace_doc(namespace), broken_cm, deployment],
+    )
+    r.assertions = [
+        ResourceAssertion("configmaps", cm_name, namespace),
+        ResourceAssertion("configmaps", cm_name, namespace, f"{{.data.{env_key}}}", p["correct_value"]),
+        ResourceAssertion("deployments.apps", deploy_name, namespace),
+        ResourceAssertion(
+            "deployments.apps", deploy_name, namespace,
+            "{.status.availableReplicas}", p["replicas"], "gte",
+        ),
+    ]
+    r.reference_manifests = [fixed_cm]
+    return r
+
+
+def render_fix_ingress(q: QuestionSpec) -> RenderResult:
+    p = q.params
+    namespace = p["namespace"]
+    name = p["name"]
+    host = p["host"]
+    port = p.get("port", 80)
+    replicas = p.get("replicas", 1)
+    labels = p["labels"]
+    marker = p["marker"]
+    svc_name = f"{name}-backend-svc"
+    deploy_name = f"{name}-backend"
+    probe = f"{name}-probe"
+    ingress_class = "nginx"
+
+    def ingress_doc(backend_svc: str) -> dict:
+        return {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "Ingress",
+            "metadata": {"name": name, "namespace": namespace},
+            "spec": {
+                "ingressClassName": ingress_class,
+                "rules": [{
+                    "host": host,
+                    "http": {"paths": [{
+                        "path": "/", "pathType": "Prefix",
+                        "backend": {"service": {"name": backend_svc, "port": {"number": port}}},
+                    }]},
+                }],
+            },
+        }
+
+    wrong_svc = f"{name}-missing-svc"
+    broken = ingress_doc(wrong_svc)
+    fixed = ingress_doc(svc_name)
+    task = (
+        f"An Ingress `{name}` in namespace `{namespace}` exists for host `{host}` but routes to "
+        f"the wrong backend (Service `{wrong_svc}` does not exist). Fix it so it routes to "
+        f"Service `{svc_name}` on port {port} and serves the expected content."
+    )
+    r = RenderResult(
+        archetype_id=q.archetype_id,
+        question_index=0,
+        task=task,
+        setup_manifests=[
+            _namespace_doc(namespace),
+            *_marker_backend(deploy_name, namespace, labels, marker, port=port, image="nginx:1.27", replicas=replicas),
+            broken,
+            _pod_doc(probe, namespace, "busybox:1.36", {"role": "probe"}, ["sh", "-c", "sleep 3600"]),
+        ],
+    )
+    r.assertions = [
+        ResourceAssertion("ingresses.networking.k8s.io", name, namespace),
+        ResourceAssertion("ingresses.networking.k8s.io", name, namespace, "{.spec.rules[0].host}", host),
+        ResourceAssertion(
+            "ingresses.networking.k8s.io", name, namespace,
+            "{.spec.rules[0].http.paths[0].backend.service.name}", svc_name,
+        ),
+        ExecContentAssertion(
+            probe, namespace, ["sh", "-c", _ingress_probe_cmd(host)],
+            expect_contains=marker,
+        ),
+    ]
+    r.reference_manifests = [fixed]
+    return r
+
+
+def render_fix_rbac(q: QuestionSpec) -> RenderResult:
+    p = q.params
+    namespace = p["namespace"]
+    sa_name = p["sa_name"]
+    role_name = p["role_name"]
+    role_kind = p["role_kind"]
+    cluster_scoped = role_kind == "ClusterRole"
+    binding_name = f"{role_name}-binding"
+    binding_ns = None if cluster_scoped else namespace
+
+    def role_doc(resources: list[str], verbs: list[str]) -> dict:
+        metadata: dict = {"name": role_name}
+        if not cluster_scoped:
+            metadata["namespace"] = namespace
+        return {
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": role_kind,
+            "metadata": metadata,
+            "rules": [{"apiGroups": [""], "resources": resources, "verbs": verbs}],
+        }
+
+    wrong_role = role_doc(p["wrong_resources"], p["wrong_verbs"])
+    fixed_role = role_doc(p["resources"], p["verbs"])
+    binding_metadata: dict = {"name": binding_name}
+    if not cluster_scoped:
+        binding_metadata["namespace"] = namespace
+    binding = {
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRoleBinding" if cluster_scoped else "RoleBinding",
+        "metadata": binding_metadata,
+        "subjects": [{"kind": "ServiceAccount", "name": sa_name, "namespace": namespace}],
+        "roleRef": {"kind": role_kind, "name": role_name, "apiGroup": "rbac.authorization.k8s.io"},
+    }
+    role_resource = "clusterroles.rbac.authorization.k8s.io" if cluster_scoped else "roles.rbac.authorization.k8s.io"
+    binding_resource = (
+        "clusterrolebindings.rbac.authorization.k8s.io" if cluster_scoped
+        else "rolebindings.rbac.authorization.k8s.io"
+    )
+    task = (
+        f"In namespace `{namespace}`, a `{role_kind}` `{role_name}` grants the wrong permissions "
+        f"to ServiceAccount `{sa_name}`. Fix the Role so it grants exactly the verbs {p['verbs']} "
+        f"on resources {p['resources']}."
+    )
+    r = RenderResult(
+        archetype_id=q.archetype_id,
+        question_index=0,
+        task=task,
+        setup_manifests=[
+            _namespace_doc(namespace),
+            {"apiVersion": "v1", "kind": "ServiceAccount", "metadata": {"name": sa_name, "namespace": namespace}},
+            wrong_role,
+            binding,
+        ],
+    )
+    r.assertions = [
+        ResourceAssertion("serviceaccounts", sa_name, namespace),
+        ResourceAssertion(role_resource, role_name, binding_ns),
+        ResourceAssertion(role_resource, role_name, binding_ns, "{.rules[*].resources[*]}", p["resources"], "superset"),
+        ResourceAssertion(role_resource, role_name, binding_ns, "{.rules[*].verbs[*]}", p["verbs"], "superset"),
+        ResourceAssertion(binding_resource, binding_name, binding_ns),
+        ResourceAssertion(binding_resource, binding_name, binding_ns, "{.subjects[*].name}", sa_name, "contains"),
+    ]
+    r.reference_manifests = [fixed_role]
+    return r
+
+
+def render_fix_autoscaling(q: QuestionSpec) -> RenderResult:
+    p = q.params
+    namespace = p["namespace"]
+    workload = p["workload"]
+    name = p["name"]
+    labels = p["labels"]
+
+    def hpa_doc(min_replicas: int, max_replicas: int) -> dict:
+        return {
+            "apiVersion": "autoscaling/v2",
+            "kind": "HorizontalPodAutoscaler",
+            "metadata": {"name": name, "namespace": namespace},
+            "spec": {
+                "scaleTargetRef": {"apiVersion": "apps/v1", "kind": "Deployment", "name": workload},
+                "minReplicas": min_replicas,
+                "maxReplicas": max_replicas,
+                "metrics": [{
+                    "type": "Resource",
+                    "resource": {
+                        "name": "cpu",
+                        "target": {"type": "Utilization", "averageUtilization": p["cpu_target"]},
+                    },
+                }],
+            },
+        }
+
+    broken = hpa_doc(p["wrong_min"], p["wrong_max"])
+    fixed = hpa_doc(p["min"], p["max"])
+    task = (
+        f"A HorizontalPodAutoscaler `{name}` for Deployment `{workload}` in namespace "
+        f"`{namespace}` has the wrong min/max replicas. Fix it so min is `{p['min']}`, max is "
+        f"`{p['max']}`, and it scales on CPU at {p['cpu_target']}%."
+    )
+    r = RenderResult(
+        archetype_id=q.archetype_id,
+        question_index=0,
+        task=task,
+        setup_manifests=[
+            _namespace_doc(namespace),
+            _deployment_doc(
+                workload, namespace, p["image"], p["replicas"], labels,
+                container_port=80,
+                resources={"requests": {"cpu": "100m"}, "limits": {"cpu": "500m"}},
+            ),
+            broken,
+        ],
+    )
+    r.assertions = [
+        ResourceAssertion("horizontalpodautoscalers.autoscaling", name, namespace),
+        ResourceAssertion("horizontalpodautoscalers.autoscaling", name, namespace, "{.spec.minReplicas}", p["min"]),
+        ResourceAssertion("horizontalpodautoscalers.autoscaling", name, namespace, "{.spec.maxReplicas}", p["max"]),
+        ResourceAssertion(
+            "horizontalpodautoscalers.autoscaling", name, namespace,
+            "{.spec.metrics[0].resource.target.averageUtilization}", p["cpu_target"],
+        ),
+    ]
+    r.reference_manifests = [fixed]
+    return r
+
+
 RENDERERS = {
     "deployment": render_deployment,
     "service": render_service,
@@ -1384,6 +1851,15 @@ RENDERERS = {
     "crd": render_crd,
     "operator": render_operator,
     "gateway": render_gateway,
+    "fix_deployment": render_fix_deployment,
+    "fix_service": render_fix_service,
+    "fix_pvc": render_fix_pvc,
+    "fix_networkpolicy": render_fix_networkpolicy,
+    "fix_scheduling": render_fix_scheduling,
+    "fix_configmap": render_fix_configmap,
+    "fix_ingress": render_fix_ingress,
+    "fix_rbac": render_fix_rbac,
+    "fix_autoscaling": render_fix_autoscaling,
 }
 
 

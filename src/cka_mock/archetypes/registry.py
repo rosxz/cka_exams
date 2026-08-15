@@ -35,7 +35,15 @@ DOMAINS: dict[str, int] = {
 # (e.g. the ingress/gateway controllers route by Host, so two questions sharing a
 # host would conflict). The generator caps how many questions one family may produce.
 FAMILIES: dict[str, tuple[str, ...]] = {
-    "ingress": ("ingress", "ingress_multi"),
+    "deployment": ("deployment", "fix_deployment"),
+    "service": ("service", "fix_service"),
+    "pvc": ("pvc", "fix_pvc"),
+    "networkpolicy": ("networkpolicy", "fix_networkpolicy"),
+    "scheduling": ("scheduling", "fix_scheduling"),
+    "configmap_secret": ("configmap_secret", "fix_configmap"),
+    "ingress": ("ingress", "ingress_multi", "fix_ingress"),
+    "rbac": ("rbac", "fix_rbac"),
+    "autoscaling": ("autoscaling", "fix_autoscaling"),
     "gateway": ("gateway",),
 }
 
@@ -620,6 +628,270 @@ def _crd_value_checks(params: dict) -> list[str]:
     if spec_type == "boolean" and (value or "") not in ("true", "false"):
         errors.append(f"instance_value must be 'true' or 'false' for spec_type 'boolean', got {value!r}")
     return errors
+
+
+def _neq(a, b, label: str) -> list[str]:
+    return [f"{label} must differ from the broken value"] if a == b else []
+
+
+_register(Archetype(
+    id="fix_deployment",
+    domain="Workloads & Scheduling",
+    competency="Understand application deployments and how to perform rolling update and rollbacks",
+    title="Fix a Deployment running the wrong image",
+    description=(
+        "A Deployment exists but is running the wrong container image. Fix it so all pods "
+        "become Ready with the expected image, replica count, and labels."
+    ),
+    topics=("troubleshooting", "deployment", "fix"),
+    params_schema={
+        "type": "object",
+        "required": ["name", "namespace", "image", "wrong_image", "replicas", "labels"],
+        "properties": {
+            "name": name_schema(),
+            "namespace": name_schema(),
+            "image": long_running_image_schema(),
+            "wrong_image": long_running_image_schema(),
+            "replicas": {"type": "integer", "minimum": 1, "maximum": 50},
+            "labels": label_schema(),
+            "container_port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        },
+        "additionalProperties": False,
+    },
+    extra_checks=lambda p: _neq(p.get("image"), p.get("wrong_image"), "image"),
+))
+
+_register(Archetype(
+    id="fix_service",
+    domain="Services & Networking",
+    competency="Use ClusterIP, NodePort, LoadBalancer service types and endpoints",
+    title="Fix a Service that is not routing traffic",
+    description=(
+        "A Service exists but its selector does not match the backend pods, so it has no "
+        "endpoints. Fix the selector so the Service routes to the backend."
+    ),
+    topics=("troubleshooting", "service", "networking", "fix"),
+    params_schema={
+        "type": "object",
+        "required": ["name", "namespace", "service_type", "port", "target_port", "backend_labels", "wrong_labels"],
+        "properties": {
+            "name": name_schema(),
+            "namespace": name_schema(),
+            "service_type": {"type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"]},
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+            "target_port": {"type": "integer", "minimum": 1, "maximum": 65535},
+            "backend_labels": label_schema(),
+            "wrong_labels": label_schema(),
+            "backend_image": long_running_image_schema(),
+            "backend_replicas": {"type": "integer", "minimum": 1, "maximum": 10},
+        },
+        "additionalProperties": False,
+    },
+    extra_checks=lambda p: _neq(p.get("backend_labels"), p.get("wrong_labels"), "backend_labels"),
+))
+
+_register(Archetype(
+    id="fix_pvc",
+    domain="Storage",
+    competency="Manage persistent volumes and persistent volume claims",
+    title="Fix a PersistentVolumeClaim that will not bind",
+    description=(
+        "A PVC exists but is stuck Pending because the StorageClass it references does not "
+        "exist. Create the missing StorageClass so the PVC binds."
+    ),
+    topics=("troubleshooting", "storage", "pvc", "storageclass", "fix"),
+    params_schema={
+        "type": "object",
+        "required": ["name", "namespace", "access_mode", "size", "storage_class"],
+        "properties": {
+            "name": name_schema(),
+            "namespace": name_schema(),
+            "access_mode": {"type": "string", "enum": ["ReadWriteOnce", "ReadOnlyMany", "ReadWriteMany"]},
+            "size": {"type": "string", "pattern": r"^\d+(Mi|Gi)$"},
+            "storage_class": name_schema(),
+        },
+        "additionalProperties": False,
+    },
+    extra_checks=lambda p: (
+        []
+        if p.get("storage_class") not in ("standard", "local-path")
+        else ["storage_class must not be a cluster default (standard/local-path)"]
+    ),
+))
+
+_register(Archetype(
+    id="fix_networkpolicy",
+    domain="Services & Networking",
+    competency="Define and enforce Network Policies",
+    title="Fix a NetworkPolicy that blocks the wrong traffic",
+    description=(
+        "A NetworkPolicy exists but is misconfigured: it blocks the intended client and allows "
+        "one that must be denied. Fix it so the peer can reach the target and the blocked pod "
+        "cannot."
+    ),
+    topics=("troubleshooting", "networkpolicy", "networking", "fix"),
+    params_schema={
+        "type": "object",
+        "required": ["name", "namespace", "target_labels", "peer_labels", "blocked_labels", "port"],
+        "properties": {
+            "name": name_schema(),
+            "namespace": name_schema(),
+            "target_labels": label_schema(),
+            "peer_labels": label_schema(),
+            "blocked_labels": label_schema(),
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+            "protocol": {"type": "string", "enum": ["TCP", "UDP"], "default": "TCP"},
+        },
+        "additionalProperties": False,
+    },
+    extra_checks=lambda p: _neq(p.get("peer_labels"), p.get("blocked_labels"), "peer_labels"),
+))
+
+_register(Archetype(
+    id="fix_scheduling",
+    domain="Workloads & Scheduling",
+    competency="Configure Pod admission and scheduling (limits, node affinity, etc.)",
+    title="Fix a Deployment that cannot be scheduled",
+    description=(
+        "A Deployment is stuck Pending because its nodeSelector does not match the labeled "
+        "node. Fix the nodeSelector so the pods schedule and become Ready."
+    ),
+    topics=("troubleshooting", "scheduling", "nodeselector", "fix"),
+    params_schema={
+        "type": "object",
+        "required": ["name", "namespace", "image", "replicas", "labels", "node_label_key", "node_label_value"],
+        "properties": {
+            "name": name_schema(),
+            "namespace": name_schema(),
+            "image": long_running_image_schema(),
+            "replicas": {"type": "integer", "minimum": 1, "maximum": 10},
+            "labels": label_schema(),
+            "node_label_key": {"type": "string", "pattern": r"^[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?$"},
+            "node_label_value": {"type": "string", "minLength": 1, "maxLength": 63},
+        },
+        "additionalProperties": False,
+    },
+))
+
+_register(Archetype(
+    id="fix_configmap",
+    domain="Workloads & Scheduling",
+    competency="Use ConfigMaps and Secrets to configure applications",
+    title="Fix a wrong value in an application ConfigMap",
+    description=(
+        "A Deployment reads a ConfigMap via envFrom, but one value is wrong. Update the "
+        "ConfigMap so the expected value is present."
+    ),
+    topics=("troubleshooting", "configmap", "configuration", "fix"),
+    params_schema={
+        "type": "object",
+        "required": ["name", "namespace", "deploy_name", "image", "labels", "replicas", "env_key", "correct_value", "wrong_value"],
+        "properties": {
+            "name": name_schema(),
+            "namespace": name_schema(),
+            "deploy_name": name_schema(),
+            "image": long_running_image_schema(),
+            "labels": label_schema(),
+            "replicas": {"type": "integer", "minimum": 1, "maximum": 10},
+            "env_key": {"type": "string", "pattern": r"^[A-Za-z_][A-Za-z0-9_]*$"},
+            "correct_value": {"type": "string", "minLength": 1, "maxLength": 500},
+            "wrong_value": {"type": "string", "minLength": 1, "maxLength": 500},
+        },
+        "additionalProperties": False,
+    },
+    extra_checks=lambda p: _neq(p.get("correct_value"), p.get("wrong_value"), "correct_value"),
+))
+
+_register(Archetype(
+    id="fix_ingress",
+    domain="Services & Networking",
+    competency="Know how to use Ingress controllers and Ingress resources",
+    title="Fix an Ingress that routes to the wrong backend",
+    description=(
+        "An Ingress exists but points at the wrong backend Service. Fix it so the host routes "
+        "to the correct Service and the backend serves the expected content."
+    ),
+    topics=("troubleshooting", "ingress", "networking", "fix"),
+    params_schema={
+        "type": "object",
+        "required": ["name", "namespace", "host", "labels", "marker"],
+        "properties": {
+            "name": name_schema(),
+            "namespace": name_schema(),
+            "host": _host_schema(),
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535, "default": 80},
+            "replicas": {"type": "integer", "minimum": 1, "maximum": 5},
+            "labels": label_schema(),
+            "marker": {"type": "string", "minLength": 1, "maxLength": 200},
+        },
+        "additionalProperties": False,
+    },
+))
+
+_register(Archetype(
+    id="fix_rbac",
+    domain="Cluster Architecture, Installation & Configuration",
+    competency="Manage role based access control (RBAC)",
+    title="Fix a Role with incorrect permissions",
+    description=(
+        "A Role/RoleBinding exists but grants the wrong verbs or resources. Fix the Role so "
+        "it grants exactly the expected permissions to the ServiceAccount."
+    ),
+    topics=("troubleshooting", "rbac", "role", "fix"),
+    params_schema={
+        "type": "object",
+        "required": ["sa_name", "namespace", "role_name", "role_kind", "resources", "verbs", "wrong_resources", "wrong_verbs"],
+        "properties": {
+            "sa_name": name_schema(),
+            "namespace": name_schema(),
+            "role_name": name_schema(),
+            "role_kind": {"type": "string", "enum": ["Role", "ClusterRole"]},
+            "resources": {"type": "array", "minItems": 1, "maxItems": 10, "items": {"type": "string"}},
+            "verbs": {"type": "array", "minItems": 1, "maxItems": 10, "items": {"type": "string"}},
+            "wrong_resources": {"type": "array", "minItems": 1, "maxItems": 10, "items": {"type": "string"}},
+            "wrong_verbs": {"type": "array", "minItems": 1, "maxItems": 10, "items": {"type": "string"}},
+        },
+        "additionalProperties": False,
+    },
+    extra_checks=lambda p: (
+        [] if (p.get("wrong_resources") != p.get("resources") or p.get("wrong_verbs") != p.get("verbs"))
+        else ["wrong_resources/wrong_verbs must differ from the correct permissions"]
+    ),
+))
+
+_register(Archetype(
+    id="fix_autoscaling",
+    domain="Workloads & Scheduling",
+    competency="Configure workload autoscaling",
+    title="Fix a HorizontalPodAutoscaler with wrong limits",
+    description=(
+        "A HorizontalPodAutoscaler exists but has the wrong min/max replicas. Fix it to the "
+        "expected values and CPU target."
+    ),
+    topics=("troubleshooting", "autoscaling", "hpa", "fix"),
+    params_schema={
+        "type": "object",
+        "required": ["name", "namespace", "workload", "min", "max", "cpu_target", "image", "replicas", "labels", "wrong_min", "wrong_max"],
+        "properties": {
+            "name": name_schema(),
+            "namespace": name_schema(),
+            "workload": name_schema(),
+            "min": {"type": "integer", "minimum": 1, "maximum": 20},
+            "max": {"type": "integer", "minimum": 1, "maximum": 50},
+            "cpu_target": {"type": "integer", "minimum": 1, "maximum": 100},
+            "image": long_running_image_schema(),
+            "replicas": {"type": "integer", "minimum": 1, "maximum": 10},
+            "labels": label_schema(),
+            "wrong_min": {"type": "integer", "minimum": 1, "maximum": 20},
+            "wrong_max": {"type": "integer", "minimum": 1, "maximum": 50},
+        },
+        "additionalProperties": False,
+    },
+    extra_checks=lambda p: (
+        [] if (p.get("wrong_min") != p.get("min") or p.get("wrong_max") != p.get("max"))
+        else ["wrong_min/wrong_max must differ from the correct values"]
+    ),
+))
 
 
 def summarize_schema(schema: dict) -> str:

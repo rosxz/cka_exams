@@ -24,6 +24,31 @@ def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
 
 
+def _run_retry(
+    cmd: list[str],
+    timeout: int,
+    retries: int,
+    ok_if: Callable[[subprocess.CompletedProcess], bool],
+) -> subprocess.CompletedProcess:
+    """Run ``cmd``, retrying on subprocess timeouts and on failures that
+    ``ok_if`` rejects. Purely a resilience helper for flaky networks: the
+    underlying command stays idempotent (e.g. ``minikube addons enable``)."""
+    attempt = 0
+    while True:
+        try:
+            proc = _run(cmd, timeout=timeout)
+            if ok_if(proc):
+                return proc
+            if attempt >= retries:
+                return proc
+            print(f"    retrying (attempt {attempt + 1}) after failure: {proc.stderr.strip()}", flush=True)
+        except subprocess.TimeoutExpired:
+            if attempt >= retries:
+                raise
+            print(f"    retrying (attempt {attempt + 1}) after timeout", flush=True)
+        attempt += 1
+
+
 def _run_in(cmd: list[str], stdin: str, **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, input=stdin, **kwargs)
 
@@ -122,8 +147,13 @@ class MinikubeEnv:
                 )
         for addon in self.addons:
             log(f"  enabling addon {addon} ...")
-            addon_proc = _run(self._base() + ["addons", "enable", addon], timeout=120)
-            if addon_proc.returncode != 0 and "already enabled" not in addon_proc.stderr:
+            addon_proc = _run_retry(
+                self._base() + ["addons", "enable", addon],
+                timeout=300,
+                retries=2,
+                ok_if=lambda p: p.returncode == 0 or "already enabled" in p.stderr,
+            )
+            if addon_proc.returncode != 0:
                 raise MinikubeError(
                     f"failed to enable addon {addon}: {addon_proc.stderr.strip()}"
                 )

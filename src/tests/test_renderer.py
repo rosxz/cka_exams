@@ -162,6 +162,93 @@ VALID_PARAMS = {
         "port": 80,
         "replicas": 1,
     },
+    "fix_deployment": {
+        "name": "web",
+        "namespace": "app",
+        "image": "nginx:1.27",
+        "wrong_image": "redis:7.2",
+        "replicas": 2,
+        "labels": {"app": "web"},
+        "container_port": 80,
+    },
+    "fix_service": {
+        "name": "web-svc",
+        "namespace": "frontend",
+        "service_type": "ClusterIP",
+        "port": 80,
+        "target_port": 8080,
+        "backend_labels": {"app": "web"},
+        "wrong_labels": {"app": "wrong"},
+        "backend_image": "nginx:1.27",
+        "backend_replicas": 1,
+    },
+    "fix_pvc": {
+        "name": "data",
+        "namespace": "db",
+        "access_mode": "ReadWriteOnce",
+        "size": "100Mi",
+        "storage_class": "slow",
+    },
+    "fix_networkpolicy": {
+        "name": "np",
+        "namespace": "api",
+        "target_labels": {"app": "api"},
+        "peer_labels": {"tier": "frontend"},
+        "blocked_labels": {"app": "blocked"},
+        "port": 8000,
+    },
+    "fix_scheduling": {
+        "name": "sched",
+        "namespace": "infra",
+        "image": "redis:7.2",
+        "replicas": 2,
+        "labels": {"app": "sched"},
+        "node_label_key": "dedicated",
+        "node_label_value": "gpu",
+    },
+    "fix_configmap": {
+        "name": "cfg",
+        "namespace": "app",
+        "deploy_name": "app",
+        "image": "nginx:1.27",
+        "labels": {"app": "app"},
+        "replicas": 1,
+        "env_key": "MODE",
+        "correct_value": "prod",
+        "wrong_value": "dev",
+    },
+    "fix_ingress": {
+        "name": "web-ing",
+        "namespace": "app",
+        "host": "web.example.com",
+        "labels": {"app": "web"},
+        "port": 80,
+        "replicas": 1,
+        "marker": "web-marker",
+    },
+    "fix_rbac": {
+        "sa_name": "deployer",
+        "namespace": "prod",
+        "role_name": "deployer-role",
+        "role_kind": "Role",
+        "resources": ["deployments", "pods"],
+        "verbs": ["get", "list", "create"],
+        "wrong_resources": ["secrets"],
+        "wrong_verbs": ["delete"],
+    },
+    "fix_autoscaling": {
+        "name": "web-hpa",
+        "namespace": "app",
+        "workload": "web",
+        "min": 1,
+        "max": 5,
+        "cpu_target": 50,
+        "image": "nginx:1.27",
+        "replicas": 1,
+        "labels": {"app": "web"},
+        "wrong_min": 2,
+        "wrong_max": 10,
+    },
 }
 
 
@@ -346,6 +433,37 @@ def test_operator_renderer_install_yourself():
     kinds = [d["kind"] for d in result.reference_manifests]
     assert kinds == ["Issuer", "Certificate"]
     assert any(isinstance(a, ResourceAssertion) and a.resource == "certificates.cert-manager.io" for a in result.assertions)
+
+
+def test_fix_archetypes_have_overlapping_reference():
+    """Most fix archetypes' reference overlaps setup (same object), so preflight
+    restore re-applies the broken state. fix_pvc is special: its reference is the
+    missing StorageClass (deleted on restore), not the PVC."""
+    from cka_mock.preflight import _overlaps_setup
+
+    overlapping = [
+        "fix_deployment", "fix_service", "fix_networkpolicy",
+        "fix_scheduling", "fix_configmap", "fix_ingress", "fix_rbac", "fix_autoscaling",
+    ]
+    for archetype_id in overlapping:
+        result = RENDERERS[archetype_id](_spec(archetype_id))
+        assert _overlaps_setup(result), archetype_id
+        assert result.reference_manifests, archetype_id
+        assert result.assertions, archetype_id
+
+    pvc = RENDERERS["fix_pvc"](_spec("fix_pvc"))
+    assert not _overlaps_setup(pvc)
+    assert pvc.reference_manifests[0]["kind"] == "StorageClass"
+    assert any(d["kind"] == "PersistentVolumeClaim" for d in pvc.setup_manifests)
+
+
+def test_fix_deployment_broken_image_differs_from_reference():
+    result = RENDERERS["fix_deployment"](_spec("fix_deployment"))
+    broken = result.setup_manifests[-1]
+    fixed = result.reference_manifests[0]
+    assert broken["spec"]["template"]["spec"]["containers"][0]["image"] == "redis:7.2"
+    assert fixed["spec"]["template"]["spec"]["containers"][0]["image"] == "nginx:1.27"
+    assert broken["metadata"]["name"] == fixed["metadata"]["name"]
 
 
 def test_gateway_renderer_contour_model():
