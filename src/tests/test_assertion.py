@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from cka_mock.assertion import (
+    ApplyFailsAssertion,
     CountAssertion,
     ExecAssertion,
     ExecContentAssertion,
+    LiveQueryMatchAssertion,
     ResourceAssertion,
     run_assertions,
 )
@@ -120,3 +122,53 @@ def test_run_assertions_uses_runner(fake_tooling):
         kubectl.run,
     )
     assert all(result.passed for result in results)
+
+
+def test_apply_fails_assertion_expects_rejection():
+    manifest = {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p", "namespace": "ns"}}
+    a = ApplyFailsAssertion(manifest)
+    assert a.to_argv() == ["apply", "-f", "-"]
+    assert "kind: Pod" in a.to_input()
+    assert a.evaluate(_completed(1, stderr="rejected by policy")).passed is True
+    assert a.evaluate(_completed(0, stdout="pod/p created")).passed is False
+
+
+def test_apply_fails_assertion_via_run_assertions(fake_tooling):
+    from cka_mock.kubectl import Kubectl
+
+    @fake_tooling.when("kubectl", "apply", "-f", "-")
+    def apply(argv):
+        return _completed(1, stderr="admission webhook denied")
+
+    kubectl = Kubectl()
+    a = ApplyFailsAssertion({"kind": "Pod", "metadata": {"name": "p", "namespace": "ns"}})
+    results = run_assertions([a], kubectl.run)
+    assert results[0].passed is True
+
+
+def test_live_query_match_assertion_compares_whitespace_normalized():
+    a = LiveQueryMatchAssertion(
+        canonical_argv=["get", "nodes", "-o", "jsonpath={.items[*].metadata.name}"],
+        stored_resource="configmaps",
+        stored_name="info",
+        stored_namespace="ns",
+        stored_jsonpath="{.data.names}",
+    )
+    # Stored value has extra newlines/whitespace; canonical query output is trimmed.
+    stored = _completed(0, stdout="node1\n  node2\n")
+    fake_runner = lambda argv: _completed(0, stdout="node1 node2")
+    assert a.evaluate(stored, fake_runner).passed is True
+
+    wrong_fake_runner = lambda argv: _completed(0, stdout="node1 node3")
+    assert a.evaluate(stored, wrong_fake_runner).passed is False
+
+
+def test_live_query_match_assertion_requires_stored_resource():
+    a = LiveQueryMatchAssertion(
+        canonical_argv=["get", "nodes", "-o", "jsonpath={.items[*].metadata.name}"],
+        stored_resource="configmaps",
+        stored_name="info",
+        stored_namespace="ns",
+        stored_jsonpath="{.data.names}",
+    )
+    assert a.evaluate(_completed(1, stderr="NotFound"), runner=None).passed is False

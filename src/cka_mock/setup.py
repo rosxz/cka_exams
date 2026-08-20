@@ -7,6 +7,7 @@ any command runs.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -63,6 +64,38 @@ def apply_reference(
         _apply_with_check(kubectl, doc, "reference")
     for command in result.reference_commands:
         kubectl.run(_substitute(command, node_name, files_dir), timeout=120)
+    if result.reference_shell_commands:
+        _run_shell_commands(kubectl, result.reference_shell_commands, files_dir)
+
+
+def _run_shell_commands(
+    kubectl: Kubectl, commands: list[str], files_dir: str | Path | None
+) -> None:
+    """Run raw shell commands with the exam KUBECONFIG exported.
+
+    Used when the reference must capture kubectl stdout into an artifact (e.g.
+    decoding a signed certificate, or seeding a ConfigMap with a query's output)
+    which cannot be expressed as static reference manifests. Everything here is
+    authored by the renderer, never by the LLM.
+    """
+    env = os.environ.copy()
+    if kubectl.kubeconfig:
+        env["KUBECONFIG"] = kubectl.kubeconfig
+    if files_dir is not None:
+        env["FILES_DIR"] = str(files_dir)
+    for command in commands:
+        substituted = subprocess.run(
+            ["sh", "-c", command.replace(FILES_TOKEN, str(files_dir))],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env=env,
+        )
+        if substituted.returncode != 0:
+            raise RuntimeError(
+                f"reference shell command failed: {command}: {substituted.stderr.strip()}"
+            )
 
 
 def apply_install_commands(
@@ -114,19 +147,23 @@ def wait_for_manifests(
     manifests: list[dict],
     *,
     skip_kinds: set[str] | None = None,
+    skip_objects: set[tuple[str, str]] | None = None,
     timeout: int = 240,
 ) -> list[str]:
     """Wait for deployments/pods/pvcs to be ready. Returns warnings for anything
     that did not reach readiness in time (an expected state, e.g. a crash-looping
-    setup Deployment, is reported as a warning, not an error)."""
+    or unschedulable setup Deployment, is reported as a warning, not an error)."""
     warnings: list[str] = []
     skip_kinds = skip_kinds or set()
+    skip_objects = skip_objects or set()
     for doc in manifests:
         kind = doc.get("kind")
         metadata = doc.get("metadata") or {}
         name = metadata.get("name")
         namespace = metadata.get("namespace")
         if kind in skip_kinds or not name:
+            continue
+        if (kind, name) in skip_objects:
             continue
         if not _wait_one(kubectl, kind, name, namespace, timeout):
             warnings.append(f"{kind.lower()}/{name} did not become ready in time")

@@ -45,6 +45,9 @@ FAMILIES: dict[str, tuple[str, ...]] = {
     "rbac": ("rbac", "fix_rbac"),
     "autoscaling": ("autoscaling", "fix_autoscaling"),
     "gateway": ("gateway",),
+    "certificates": ("csr",),
+    "admission": ("validating_admission_policy",),
+    "jsonpath": ("jsonpath",),
 }
 
 
@@ -891,6 +894,76 @@ _register(Archetype(
         [] if (p.get("wrong_min") != p.get("min") or p.get("wrong_max") != p.get("max"))
         else ["wrong_min/wrong_max must differ from the correct values"]
     ),
+))
+
+_register(Archetype(
+    id="csr",
+    domain="Cluster Architecture, Installation & Configuration",
+    competency="Understand ownership of and uses of certificates, and manage certificate signing requests",
+    title="Sign a certificate signing request and use the certificate",
+    description=(
+        "Generate a private key, create a CertificateSigningRequest for a user CN, approve it so it "
+        "gets signed by the cluster CA, extract the issued certificate, and store the key + certificate "
+        "as a TLS Secret."
+    ),
+    topics=("certificates", "csr", "certificate-signing-request", "tls", "openssl"),
+    params_schema={
+        "type": "object",
+        "required": ["csr_name", "cn", "namespace", "secret_name"],
+        "properties": {
+            "csr_name": name_schema(),
+            "cn": {"type": "string", "pattern": r"^[A-Za-z0-9][A-Za-z0-9._@/-]*$", "minLength": 1, "maxLength": 64},
+            "namespace": name_schema(),
+            "secret_name": name_schema(),
+        },
+        "additionalProperties": False,
+    },
+))
+
+_register(Archetype(
+    id="validating_admission_policy",
+    domain="Cluster Architecture, Installation & Configuration",
+    competency="Understand admission controllers and admission control",
+    title="Enforce a label policy with admission control",
+    description=(
+        "Create a ValidatingAdmissionPolicy that rejects any Pod created or updated in a namespace "
+        "unless it carries a required label, and bind it to that namespace."
+    ),
+    topics=("admission", "admission-controller", "validatingadmissionpolicy", "cel", "policy"),
+    params_schema={
+        "type": "object",
+        "required": ["policy_name", "binding_name", "namespace", "label_key"],
+        "properties": {
+            "policy_name": name_schema(),
+            "binding_name": name_schema(),
+            "namespace": name_schema(),
+            "label_key": {"type": "string", "pattern": r"^[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?(\/[a-zA-Z0-9]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?)?$"},
+        },
+        "additionalProperties": False,
+    },
+))
+
+_register(Archetype(
+    id="jsonpath",
+    domain="Cluster Architecture, Installation & Configuration",
+    competency="Use JSON, YAML, and JSONPath output to query cluster resources efficiently",
+    title="Extract cluster data with kubectl JSONPath",
+    description=(
+        "Run a kubectl command with -o jsonpath to extract spec&#64257;ed data from the cluster and store "
+        "the output in a ConfigMap."
+    ),
+    topics=("jsonpath", "kubectl", "output", "query"),
+    params_schema={
+        "type": "object",
+        "required": ["cm_name", "cm_namespace", "cm_key", "query"],
+        "properties": {
+            "cm_name": name_schema(),
+            "cm_namespace": name_schema(),
+            "cm_key": name_schema(),
+            "query": {"type": "string", "enum": ["node_names", "node_internal_ips", "node_os_image"]},
+        },
+        "additionalProperties": False,
+    },
 ))
 
 

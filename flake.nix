@@ -29,6 +29,7 @@
           pkgs.minikube
           pkgs.kubernetes-helm
           pkgs.kustomize
+          pkgs.openssl
           (pkgs.writeShellScriptBin "k" "exec ${pkgs.kubernetes}/bin/kubectl \"\$@\"")
         ];
 

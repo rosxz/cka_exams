@@ -249,6 +249,24 @@ VALID_PARAMS = {
         "wrong_min": 2,
         "wrong_max": 10,
     },
+    "csr": {
+        "csr_name": "user-csr",
+        "cn": "dev-user",
+        "namespace": "certns",
+        "secret_name": "dev-tls",
+    },
+    "validating_admission_policy": {
+        "policy_name": "req-label",
+        "binding_name": "req-label-bind",
+        "namespace": "admons",
+        "label_key": "env",
+    },
+    "jsonpath": {
+        "cm_name": "node-info",
+        "cm_namespace": "jpath",
+        "cm_key": "names",
+        "query": "node_names",
+    },
 }
 
 

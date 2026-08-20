@@ -39,6 +39,7 @@ class FakeTooling:
 
     def run(self, argv, *args: Any, check: bool = False, **kwargs: Any) -> subprocess.CompletedProcess:
         self.calls.append(list(argv))
+        self.last_kwargs = dict(kwargs)
         result: subprocess.CompletedProcess | None = None
 
         for prefix, fn in self.handlers:

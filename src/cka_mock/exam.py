@@ -169,7 +169,11 @@ def _run_exam_flow(cfg, plan, results, workdir, exam_dir, *, raw, provider=None)
         addons=tuple(_needed_addons(cfg, results)),
     )
     console.print(f"[bold]Preparing minikube profile[/bold] {cfg.minikube_profile} ...")
-    env.start(reset=True, log=lambda msg: console.print(msg))
+    env.start(
+        reset=cfg.reset_cluster,
+        log=lambda msg: console.print(msg),
+        preload_images=cfg.preload_images,
+    )
 
     kubeconfig = env.export_kubeconfig(exam_dir / "kubeconfig")
     kubectl = env.kubectl(kubeconfig)
@@ -234,9 +238,11 @@ def _setup_questions(
         repairs_left = max(0, cfg.repair_attempts) if provider is not None else 0
         while True:
             log(f"  Q{result.question_index}: {result.archetype_id} ...")
-            skip_kinds = {"Deployment"} if result.archetype_id == "troubleshooting_crashloop" else None
             apply_result_setup(kubectl, result, node_name, files_dir)
-            setup_warnings = wait_for_manifests(kubectl, result.setup_manifests, skip_kinds=skip_kinds)
+            setup_warnings = wait_for_manifests(
+                kubectl, result.setup_manifests,
+                skip_objects=result.setup_waits_skip,
+            )
             for warning in setup_warnings:
                 log(f"    [yellow]warn[/yellow] Q{result.question_index}: {warning}")
             try:

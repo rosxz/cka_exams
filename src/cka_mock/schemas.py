@@ -165,6 +165,7 @@ def validate_exam_payload(payload: object, registry, max_per_family: int = 3) ->
 
     questions = payload["questions"]
     seen: set[tuple[str, str]] = set()
+    seen_csr_names: set[str] = set()  # CertificateSigningRequests are cluster-scoped
     family_counts: dict[str, int] = {}
     seen_hosts: set[str] = set()
     seen_storage_classes: set[str] = set()
@@ -215,6 +216,12 @@ def validate_exam_payload(payload: object, registry, max_per_family: int = 3) ->
             if key in seen:
                 result.append(f"question {index}: duplicate (namespace={namespace!r}, name={name!r})")
             seen.add(key)
+
+        csr_name = params.get("csr_name")
+        if archetype_id == "csr" and isinstance(csr_name, str) and csr_name:
+            if csr_name in seen_csr_names:
+                result.append(f"question {index}: CSR name {csr_name!r} is used by another question")
+            seen_csr_names.add(csr_name)
 
     for family, count in sorted(family_counts.items()):
         if count > max_per_family:

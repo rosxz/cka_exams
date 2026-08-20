@@ -151,3 +151,100 @@ def test_enable_ingress_raises_if_never_ready(fake_tooling, monkeypatch):
     env = MinikubeEnv(profile="cka-exam", addons=("ingress",))
     with pytest.raises(MinikubeError, match="ingress addon did not become ready"):
         env._enable_addons(log=lambda _m: None, ingress_timeout=6)
+
+
+def test_start_reuses_running_compatible_cluster(fake_tooling, monkeypatch):
+    _fake_bins(monkeypatch)
+    fake_tooling.respond("minikube", "-p", "cka-exam", "status", "-o", "json",
+                         stdout='{"APIServer":"Running","K8sVersion":"v1.35.1"}')
+    fake_tooling.respond("minikube", "-p", "cka-exam", "addons", "list", "-o", "json",
+                         stdout='{"metrics-server":{"Status":"enabled"},"ingress":{"Status":"enabled"}}')
+    fake_tooling.respond("kubectl", "--context", "cka-exam", "get", "nodes",
+                         "-o", "jsonpath={.items[0].status.conditions[?(@.type==\"Ready\")].status}",
+                         stdout="True")
+    # Reuse path: no minikube start/delete/addons-enable should run.
+    env = MinikubeEnv(profile="cka-exam", addons=("metrics-server", "ingress"))
+    env.start(reset=False, preload_images=False, log=lambda _m: None)
+    assert not any("start" in call for call in fake_tooling.calls)
+    assert not any("delete" in call for call in fake_tooling.calls)
+    assert not any("addons" in call and "enable" in call for call in fake_tooling.calls)
+
+
+def test_start_resets_when_requested(fake_tooling, monkeypatch):
+    _fake_bins(monkeypatch)
+    fake_tooling.respond("minikube", "-p", "cka-exam", "status", "-o", "json",
+                         stdout='{"APIServer":"Not Running"}')
+    fake_tooling.respond("minikube", "-p", "cka-exam", "delete")
+    fake_tooling.respond("minikube", "-p", "cka-exam", "start", "--network-plugin=cni", "--cni=calico",
+                         stdout="* Done!")
+    fake_tooling.respond("minikube", "-p", "cka-exam", "addons", "list", "-o", "json",
+                         stdout='{}')
+    fake_tooling.respond("minikube", "-p", "cka-exam", "addons", "enable", "metrics-server")
+    fake_tooling.respond("kubectl", "--context", "cka-exam", "get", "nodes",
+                         "-o", "jsonpath={.items[0].status.conditions[?(@.type==\"Ready\")].status}",
+                         stdout="True")
+    env = MinikubeEnv(profile="cka-exam", addons=("metrics-server",))
+    env.start(reset=True, preload_images=False, log=lambda _m: None)
+    assert any("delete" in call for call in fake_tooling.calls)
+    assert any("start" in call for call in fake_tooling.calls)
+
+
+def test_start_does_not_reuse_when_addon_missing(fake_tooling, monkeypatch):
+    _fake_bins(monkeypatch)
+    fake_tooling.respond("minikube", "-p", "cka-exam", "status", "-o", "json",
+                         stdout='{"APIServer":"Running","K8sVersion":"v1.35.1"}')
+    fake_tooling.respond("minikube", "-p", "cka-exam", "addons", "list", "-o", "json",
+                         stdout='{"metrics-server":{"Status":"disabled"}}')
+    fake_tooling.respond("minikube", "-p", "cka-exam", "delete")
+    fake_tooling.respond("minikube", "-p", "cka-exam", "start", "--network-plugin=cni", "--cni=calico",
+                         stdout="* Done!")
+    for label in ("minikube.k8s.io/primary=true", "ingress-ready=true"):
+        fake_tooling.respond(
+            "kubectl", "--context", "cka-exam", "label", "nodes", "--all", label, "--overwrite"
+        )
+    fake_tooling.respond("minikube", "-p", "cka-exam", "addons", "enable", "ingress")
+    fake_tooling.respond("kubectl", "--context", "cka-exam", "get", "nodes",
+                         "-o", "jsonpath={.items[0].status.conditions[?(@.type==\"Ready\")].status}",
+                         stdout="True")
+    fake_tooling.respond("kubectl", "--context", "cka-exam", "get", "deploy", "ingress-nginx-controller",
+                         "-n", "ingress-nginx", "-o", "jsonpath={.status.availableReplicas}", stdout="1")
+    for job in ("ingress-nginx-admission-create", "ingress-nginx-admission-patch"):
+        fake_tooling.respond(
+            "kubectl", "--context", "cka-exam", "get", "job", job,
+            "-n", "ingress-nginx", "-o", "jsonpath={.status.succeeded}", stdout="1",
+        )
+    fake_tooling.respond("kubectl", "--context", "cka-exam", "delete", "ingress",
+                         "cka-webhook-probe", "-n", "ingress-nginx", "--ignore-not-found")
+    fake_tooling.respond("kubectl", "--context", "cka-exam", "apply", "-f", "-")
+    env = MinikubeEnv(profile="cka-exam", addons=("ingress",))
+    env.start(reset=False, preload_images=False, log=lambda _m: None)
+    assert any("addons" in call and "enable" in call for call in fake_tooling.calls)
+
+
+def test_preload_images_pulls_allowlist_in_parallel(fake_tooling, monkeypatch):
+    _fake_bins(monkeypatch)
+    fake_tooling.respond("minikube", "-p", "cka-exam", "image", "ls", stdout="registry.k8s.io/pause:3.10")
+
+    @fake_tooling.when("minikube", "-p", "cka-exam", "image", "pull")
+    def pull(argv):
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    env = MinikubeEnv(profile="cka-exam", addons=("metrics-server",))
+    env._preload_images(log=lambda _m: None)
+    pulls = [call for call in fake_tooling.calls if "pull" in call]
+    pulled_images = {call[-1] for call in pulls}
+    assert "nginx:1.27" in pulled_images
+    assert "redis:7.2" in pulled_images
+    assert len(pulls) >= 4  # several allowlisted images preloaded in parallel
+
+
+def test_preload_images_skips_present_images(fake_tooling, monkeypatch):
+    _fake_bins(monkeypatch)
+    from cka_mock.schemas import IMAGE_ALLOWLIST
+    present = "registry.k8s.io/pause:3.10\n" + "\n".join(
+        "docker.io/library/" + img for img in IMAGE_ALLOWLIST
+    ) + "\nquay.io/calico/node:v3.31.3\nquay.io/calico/cni:v3.31.3"
+    fake_tooling.respond("minikube", "-p", "cka-exam", "image", "ls", stdout=present)
+    env = MinikubeEnv(profile="cka-exam", addons=("metrics-server",))
+    env._preload_images(log=lambda _m: None)
+    assert not any("pull" in call for call in fake_tooling.calls)

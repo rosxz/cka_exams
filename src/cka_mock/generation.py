@@ -73,7 +73,8 @@ def build_generation_prompt(
     lines.append(
         f"At most {max_per_family} questions may come from the same family (the 'ingress' family "
         f"includes both 'ingress' and 'ingress_multi'). All Ingress host names must be unique "
-        f"across the exam. Diversify archetypes."
+        f"across the exam. CertificateSigningRequest names must be unique across the exam. "
+        f"Diversify archetypes."
     )
     return "\n".join(lines)
 

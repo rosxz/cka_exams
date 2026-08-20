@@ -36,6 +36,11 @@ class Config:
     topics: list[str] = field(default_factory=list)
     addons: list[str] = field(default_factory=lambda: ["metrics-server"])
     difficulty: str = "medium"
+    # Reuse a running, compatible minikube profile instead of deleting and
+    # recreating it on every run. Huge speedup for repeated `new`/`e2e` runs on
+    # slow connections (skips base image + CNI + addon re-downloads).
+    reset_cluster: bool = True
+    preload_images: bool = True
 
     @property
     def api_key(self) -> str | None:

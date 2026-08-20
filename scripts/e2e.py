@@ -350,6 +350,33 @@ PAYLOAD = {
             },
         },
         {
+            "archetype": "csr",
+            "params": {
+                "csr_name": "user-csr",
+                "cn": "dev-user",
+                "namespace": "certns",
+                "secret_name": "dev-tls",
+            },
+        },
+        {
+            "archetype": "validating_admission_policy",
+            "params": {
+                "policy_name": "req-label",
+                "binding_name": "req-label-bind",
+                "namespace": "admons",
+                "label_key": "env",
+            },
+        },
+        {
+            "archetype": "jsonpath",
+            "params": {
+                "cm_name": "node-info",
+                "cm_namespace": "jpath",
+                "cm_key": "names",
+                "query": "node_names",
+            },
+        },
+        {
             "archetype": "fix_autoscaling",
             "params": {
                 "name": "web-hpa",
@@ -380,7 +407,7 @@ def main() -> int:
     addons = _needed_addons(Config(addons=["metrics-server"]), results)
     work_root = Path("/tmp/cka_e2e_work")
     env = MinikubeEnv(profile="cka-exam", addons=tuple(addons))
-    env.start(reset=True, log=lambda m: print(m))
+    env.start(reset=False, log=lambda m: print(m), preload_images=True)
 
     wd = Workdir(work_root)
     exam_dir = wd.new_exam()
@@ -393,9 +420,10 @@ def main() -> int:
 
     for result in results:
         print(f"--- setup Q{result.question_index} ({result.archetype_id}) ---")
-        skip = {"Deployment"} if result.archetype_id == "troubleshooting_crashloop" else None
         apply_result_setup(kubectl, result, node_name, files_dir)
-        for warning in wait_for_manifests(kubectl, result.setup_manifests, skip_kinds=skip):
+        for warning in wait_for_manifests(
+            kubectl, result.setup_manifests, skip_objects=result.setup_waits_skip
+        ):
             print("  setup warn:", warning)
         try:
             report = preflight_result(kubectl, result, node_name, files_dir=files_dir)

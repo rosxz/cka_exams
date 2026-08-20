@@ -53,6 +53,16 @@ def _run_in(cmd: list[str], stdin: str, **kwargs) -> subprocess.CompletedProcess
     return subprocess.run(cmd, capture_output=True, text=True, input=stdin, **kwargs)
 
 
+def _normalize_image(image: str) -> str:
+    """Strip a default registry prefix so all sides compare on the bare name."""
+    text = image.strip()
+    for prefix in ("docker.io/library/", "docker.io/", "registry.k8s.io/"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    return text
+
+
 # minikube's ingress-nginx controller schedules only on nodes carrying these
 # labels; without them its pods stay Pending and `addons enable ingress` blocks.
 _INGRESS_NODE_LABELS = ("minikube.k8s.io/primary=true", "ingress-ready=true")
@@ -105,33 +115,43 @@ class MinikubeEnv:
         reset: bool = True,
         wait_timeout: int = 600,
         log: Callable[[str], None] = print,
+        preload_images: bool = True,
     ) -> None:
-        if reset:
-            log("  deleting previous profile (if any) ...")
-            self.delete()
-        cmd = self._base() + ["start"]
-        if self.driver:
-            cmd += ["--driver", self.driver]
-        if self.cpus:
-            cmd += ["--cpus", str(self.cpus)]
-        if self.memory:
-            cmd += ["--memory", str(self.memory)]
-        if self.cni:
-            # The default minikube CNI does not enforce NetworkPolicies; use a
-            # policy-capable CNI so NetworkPolicy challenges are verifiable.
-            cmd += ["--network-plugin=cni", f"--cni={self.cni}"]
-        log(
-            f"  starting cluster (profile {self.profile}, driver={self.driver or 'auto'}, "
-            f"cni={self.cni or 'default'}) ..."
-        )
-        log("    the first start downloads the base image and CNI images; this can take several minutes")
         started = time.monotonic()
-        proc = _run(cmd, timeout=900)
-        if proc.returncode != 0:
-            raise MinikubeError(f"minikube start failed: {proc.stderr.strip()}")
-        log(f"  cluster started in {time.monotonic() - started:.0f}s; waiting for node Ready ...")
-        self._wait_nodes_ready(wait_timeout)
-        self._enable_addons(log)
+        log("  checking existing profile ...")
+        status = self.status()
+        reuse = (not reset) and status.get("running") and self._addons_satisfied()
+        if reset or not reuse:
+            if not reuse:
+                log("  deleting previous profile (if any) ...")
+                self.delete()
+            cmd = self._base() + ["start"]
+            if self.driver:
+                cmd += ["--driver", self.driver]
+            if self.cpus:
+                cmd += ["--cpus", str(self.cpus)]
+            if self.memory:
+                cmd += ["--memory", str(self.memory)]
+            if self.cni:
+                # The default minikube CNI does not enforce NetworkPolicies; use a
+                # policy-capable CNI so NetworkPolicy challenges are verifiable.
+                cmd += ["--network-plugin=cni", f"--cni={self.cni}"]
+            log(
+                f"  starting cluster (profile {self.profile}, driver={self.driver or 'auto'}, "
+                f"cni={self.cni or 'default'}) ..."
+            )
+            log("    the first start downloads the base image and CNI images; this can take several minutes")
+            proc = _run(cmd, timeout=900)
+            if proc.returncode != 0:
+                raise MinikubeError(f"minikube start failed: {proc.stderr.strip()}")
+            log(f"  cluster started in {time.monotonic() - started:.0f}s; waiting for node Ready ...")
+            self._wait_nodes_ready(wait_timeout)
+            self._enable_addons(log)
+        else:
+            log("  reusing running cluster; ensuring node Ready ...")
+            self._wait_nodes_ready(wait_timeout)
+        if preload_images:
+            self._preload_images(log)
 
     def _enable_addons(self, log: Callable[[str], None], ingress_timeout: int = 300) -> None:
         if "ingress" in self.addons:
@@ -160,6 +180,85 @@ class MinikubeEnv:
         if "ingress" in self.addons:
             self._wait_ingress_ready(log, timeout=ingress_timeout)
         log("  cluster ready")
+
+    def _addons_satisfied(self) -> bool:
+        """True when every requested addon is already enabled on the profile."""
+        proc = _run(self._base() + ["addons", "list", "-o", "json"], timeout=30)
+        if proc.returncode != 0:
+            return False
+        try:
+            data = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return False
+        enabled = {name for name, info in data.items() if str(info.get("Status", "")).lower() == "enabled"}
+        return set(self.addons) <= enabled
+
+    def _preload_images(self, log: Callable[[str], None], timeout: int = 600) -> None:
+        """Pull the curated worker images into the cluster in parallel.
+
+        Pod scheduling only waits for the *first* pod using an image; preloading
+        every allowlisted image right after startup means question setup never
+        stalls on the network. Images already present in the node runtime are
+        skipped by the pull, so re-runs are near-instant.
+        """
+        try:
+            from .schemas import IMAGE_ALLOWLIST
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+        except ImportError:  # pragma: no cover - schemas always importable
+            return
+
+        present = self._present_images()
+        needed = [img for img in IMAGE_ALLOWLIST if _normalize_image(img) not in present]
+        if self.cni and self.cni != "none":
+            for calico_img in ("quay.io/calico/node:v3.31.3", "quay.io/calico/cni:v3.31.3"):
+                if _normalize_image(calico_img) not in present:
+                    needed.append(calico_img)
+        if "ingress" in self.addons:
+            for ing_img in (
+                "registry.k8s.io/ingress-nginx/controller:v1.14.3",
+                "registry.k8s.io/ingress-nginx/kube-webhook-certgen:v1.6.7",
+            ):
+                if _normalize_image(ing_img) not in present:
+                    needed.append(ing_img)
+        needed = list(dict.fromkeys(needed))
+        if not needed:
+            return
+
+        log(f"  preloading {len(needed)} image(s) in parallel ...")
+        start = time.monotonic()
+        failures: list[str] = []
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(self._pull_image, img): img for img in needed}
+            for fut in as_completed(futures):
+                img = futures[fut]
+                try:
+                    ok = fut.result()
+                except Exception as exc:  # noqa: BLE001 - report and continue
+                    ok = False
+                    failures.append(f"{img}: {exc}")
+                if not ok:
+                    failures.append(img)
+        if failures:
+            # Image pull is best-effort: pods fall back to the normal kubelet pull.
+            log(f"  [yellow]warn[/yellow] image preload incomplete: {', '.join(sorted(set(failures)))}")
+        log(f"  image preload done in {time.monotonic() - start:.0f}s")
+
+    def _present_images(self) -> set[str]:
+        proc = _run(self._base() + ["image", "ls"], timeout=60)
+        if proc.returncode != 0:
+            return set()
+        # Normalize to bare short names (minikube lists docker.io/library/nginx:1.27;
+        # the allowlist uses nginx:1.27).
+        normalized = set()
+        for line in proc.stdout.splitlines():
+            if not line.strip():
+                continue
+            normalized.add(_normalize_image(line.strip()))
+        return normalized
+
+    def _pull_image(self, image: str) -> bool:
+        proc = _run(self._base() + ["image", "pull", image], timeout=300)
+        return proc.returncode == 0
 
     def _wait_ingress_ready(self, log: Callable[[str], None], timeout: int = 300) -> None:
         """Wait until the ingress controller, its admission cert jobs, and the

@@ -10,6 +10,8 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+import yaml
+
 
 @dataclass(frozen=True)
 class AssertionResult:
@@ -22,7 +24,11 @@ class Assertion:
     def to_argv(self) -> list[str]:
         raise NotImplementedError
 
-    def evaluate(self, proc) -> AssertionResult:
+    def to_input(self) -> str | None:
+        """Manifest bytes to pipe to the command via stdin (e.g. ``apply -f -``)."""
+        return None
+
+    def evaluate(self, proc, runner=None) -> AssertionResult:
         raise NotImplementedError
 
 
@@ -107,7 +113,7 @@ class ResourceAssertion(Assertion):
             argv += ["-o", f"jsonpath={self.jsonpath}"]
         return argv
 
-    def evaluate(self, proc) -> AssertionResult:
+    def evaluate(self, proc, runner=None) -> AssertionResult:
         label = f"{self.resource}/{self.name}"
         if proc.returncode != 0:
             return AssertionResult(False, f"{label} exists", actual=proc.stderr.strip())
@@ -132,7 +138,7 @@ class CountAssertion(Assertion):
             argv += ["-l", self.selector]
         return argv
 
-    def evaluate(self, proc) -> AssertionResult:
+    def evaluate(self, proc, runner=None) -> AssertionResult:
         count = len([line for line in proc.stdout.splitlines() if line.strip()])
         if self.op == "gte":
             passed = count >= self.expect
@@ -162,7 +168,7 @@ class ExecAssertion(Assertion):
         argv += [self.pod, "--", *(self.command or [])]
         return argv
 
-    def evaluate(self, proc) -> AssertionResult:
+    def evaluate(self, proc, runner=None) -> AssertionResult:
         rc = proc.returncode
         passed = (rc == self.expect_rc) if self.op == "eq" else (rc != self.expect_rc)
         return AssertionResult(
@@ -186,7 +192,7 @@ class ExecContentAssertion(Assertion):
         argv += [self.pod, "--", *(self.command or [])]
         return argv
 
-    def evaluate(self, proc) -> AssertionResult:
+    def evaluate(self, proc, runner=None) -> AssertionResult:
         if proc.returncode != 0:
             return AssertionResult(
                 False,
@@ -205,10 +211,96 @@ def run_assertions(assertions: list[Assertion], runner) -> list[AssertionResult]
     """Run assertions against a kubectl runner callable.
 
     ``runner(argv)`` must return an object with ``returncode``, ``stdout``, and
-    ``stderr`` attributes (e.g. ``Kubectl.run``).
+    ``stderr`` attributes (e.g. ``Kubectl.run``). Assertions that need to run
+    additional queries pass the ``runner`` into their ``evaluate``; assertions
+    that pipe a manifest via stdin expose ``to_input``.
     """
     results: list[AssertionResult] = []
     for assertion in assertions:
-        proc = runner(assertion.to_argv())
-        results.append(assertion.evaluate(proc))
+        if getattr(assertion, "pre_argv", None):
+            runner(list(assertion.pre_argv))
+        kwargs = {}
+        stdin = assertion.to_input()
+        if stdin is not None:
+            kwargs["input"] = stdin
+        proc = runner(assertion.to_argv(), **kwargs)
+        results.append(assertion.evaluate(proc, runner))
     return results
+
+
+@dataclass(frozen=True)
+class ApplyFailsAssertion(Assertion):
+    """Apply a manifest and require the API server to REJECT it (non-zero rc).
+
+    Used to prove an admission policy actually enforces a rule: if the constraint
+    were not in place, the apply would succeed.
+
+    ``pre_argv`` (if set) runs first — typically a best-effort delete of the same
+    object so each check is a genuine CREATE rather than a no-op on a pre-existing
+    unchanged object (which `kubectl apply` would report as success).
+    """
+
+    manifest: dict
+    description: str = "apply of a violating resource is rejected"
+    pre_argv: list[str] | None = None
+
+    def to_argv(self) -> list[str]:
+        return ["apply", "-f", "-"]
+
+    def to_input(self) -> str:
+        return yaml.safe_dump(self.manifest, sort_keys=False, default_flow_style=False)
+
+    def evaluate(self, proc, runner=None) -> AssertionResult:
+        if proc.returncode == 0:
+            return AssertionResult(
+                False,
+                f"{self.description}: expected rejection but the apply succeeded",
+                actual=proc.stdout.strip()[:120],
+            )
+        return AssertionResult(True, self.description, actual=proc.stderr.strip()[:120])
+
+
+@dataclass(frozen=True)
+class LiveQueryMatchAssertion(Assertion):
+    """Compare a candidate-stored value against a canonical query's live output.
+
+    The candidate is told to store the output of a kubectl query in a target
+    object (e.g. a ConfigMap). At grade time this assertion re-runs the same
+    canonical query against the live cluster to derive the expected value, then
+    compares it (whitespace-normalized) to the value the candidate stored.
+
+    This makes JSONPath/formatting challenges verifiable regardless of
+    environment-specific values (node names, IPs, image tags, ...).
+    """
+
+    canonical_argv: list[str]
+    stored_resource: str
+    stored_name: str
+    stored_namespace: str | None
+    stored_jsonpath: str
+
+    def to_argv(self) -> list[str]:
+        argv = ["get", self.stored_resource, self.stored_name]
+        if self.stored_namespace:
+            argv += ["-n", self.stored_namespace]
+        argv += ["-o", f"jsonpath={self.stored_jsonpath}"]
+        return argv
+
+    def evaluate(self, proc, runner=None) -> AssertionResult:
+        stored = " ".join(proc.stdout.strip().split())
+        if proc.returncode != 0:
+            return AssertionResult(
+                False, "candidate answer is stored", actual=proc.stderr.strip()[:120]
+            )
+        if runner is None:
+            expected: str = ""
+        else:
+            expected_proc = runner(list(self.canonical_argv))
+            expected = " ".join(expected_proc.stdout.strip().split())
+        passed = stored == expected
+        return AssertionResult(
+            passed,
+            f"stored value matches canonical query output "
+            f"({' '.join(self.canonical_argv)})",
+            actual={"stored": stored, "expected": expected},
+        )

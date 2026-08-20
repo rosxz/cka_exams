@@ -13,14 +13,18 @@ import yaml
 
 from .archetypes import REGISTRY
 from .assertion import (
+    ApplyFailsAssertion,
     Assertion,
     CountAssertion,
     ExecAssertion,
     ExecContentAssertion,
+    LiveQueryMatchAssertion,
     ResourceAssertion,
 )
 from .manifests import fetch_manifest, rewrite_contour_manifest
 from .schemas import QuestionSpec
+
+from ._csr_ref import CERT_PEM_HEADER_B64, PRIV_KEY_PEM_HEADER_B64, REF_CSR_B64, REF_PRIVATE_KEY
 
 NODE_TOKEN = "{{NODE}}"
 FILES_TOKEN = "{{FILES}}"
@@ -53,6 +57,15 @@ class RenderResult:
     reference_install_commands: list[list[str]] = field(default_factory=list)
     reference_ready_assertions: list[Assertion] = field(default_factory=list)
     reference_teardown_commands: list[list[str]] = field(default_factory=list)
+    # Optional raw shell commands run with KUBECONFIG set, after any regular
+    # reference commands. Used when the reference must capture kubectl output
+    # into an artifact (e.g. decoding a signed certificate or seeding a
+    # ConfigMap with a query's stdout) before assertions run.
+    reference_shell_commands: list[str] = field(default_factory=list)
+    # Setup objects that are intentionally broken (e.g. a Deployment the candidate
+    # must fix). Setup-phase readiness waits must skip them: waiting would block
+    # for the full timeout on a resource that is *supposed* to be unhealthy.
+    setup_waits_skip: set[tuple[str, str]] = field(default_factory=set)
 
 
 def _dump(doc: dict) -> str:
@@ -480,6 +493,7 @@ def render_troubleshooting_crashloop(q: QuestionSpec) -> RenderResult:
         question_index=0,
         task=task,
         setup_manifests=[_namespace_doc(namespace), broken],
+        setup_waits_skip={("Deployment", name)},
     )
     selector = _selector_string(labels)
     r.assertions = [
@@ -1365,6 +1379,268 @@ def render_gateway(q: QuestionSpec) -> RenderResult:
     return r
 
 
+def render_csr(q: QuestionSpec) -> RenderResult:
+    p = q.params
+    csr_name = p["csr_name"]
+    cn = p["cn"]
+    namespace = p["namespace"]
+    secret_name = p["secret_name"]
+    signer_name = "kubernetes.io/kube-apiserver-client"
+
+    task = (
+        f"Generate a private key and a certificate signing request for the user CN `{cn}`:\n"
+        f"    openssl genrsa -out user.key 2048\n"
+        f"    openssl req -new -key user.key -subj /CN={cn} -out user.csr\n"
+        f"Create a CertificateSigningRequest named `{csr_name}` with that request:\n"
+        f"    kubectl apply -f - <<EOF\n"
+        f"apiVersion: certificates.k8s.io/v1\n"
+        f"kind: CertificateSigningRequest\n"
+        f"metadata:\n"
+        f"  name: {csr_name}\n"
+        f"spec:\n"
+        f"  request: $(base64 -w0 user.csr)\n"
+        f"  signerName: {signer_name}\n"
+        f"  usages:\n"
+        f"    - client auth\n"
+        f"EOF\n"
+        f"Approve the request:\n"
+        f"    kubectl certificate approve {csr_name}\n"
+        f"The cluster signs it with the CA. Extract the issued certificate:\n"
+        f"    kubectl get csr {csr_name} -o jsonpath='{{.status.certificate}}' | base64 -d > user.crt\n"
+        f"Finally, create a TLS Secret named `{secret_name}` in namespace `{namespace}` containing "
+        f"the key and certificate:\n"
+        f"    kubectl create secret tls {secret_name} -n {namespace} --cert=user.crt --key=user.key\n"
+    )
+
+    key_pem = REF_PRIVATE_KEY
+    # Shell commands for the reference solution: approve the request, wait for the
+    # CA to sign it, decode the certificate, and create the TLS Secret.
+    shell_wait = (
+        "for i in $(seq 1 60); do "
+        f"CERT=$(kubectl get csr {csr_name} -o jsonpath={{.status.certificate}} 2>/dev/null || true); "
+        "[ -n \"$CERT\" ] && break; sleep 2; done; "
+        "if [ -z \"${CERT:-}\" ]; then echo 'CSR was not signed in time' >&2; exit 1; fi"
+    )
+    shell_create_secret = (
+        f"printf '%s\\n' '{key_pem}' > /tmp/cka_ref_user.key\n"
+        f"kubectl get csr {csr_name} -o jsonpath={{.status.certificate}} | base64 -d > /tmp/cka_ref_user.crt\n"
+        f"kubectl create secret tls {secret_name} -n {namespace} "
+        f"--cert=/tmp/cka_ref_user.crt --key=/tmp/cka_ref_user.key\n"
+    )
+
+    r = RenderResult(
+        archetype_id=q.archetype_id,
+        question_index=0,
+        task=task,
+        setup_manifests=[_namespace_doc(namespace)],
+        reference_manifests=[
+            {
+                "apiVersion": "certificates.k8s.io/v1",
+                "kind": "CertificateSigningRequest",
+                "metadata": {"name": csr_name},
+                "spec": {
+                    "request": REF_CSR_B64,
+                    "signerName": signer_name,
+                    "usages": ["client auth"],
+                },
+            },
+        ],
+        reference_commands=[["certificate", "approve", csr_name]],
+        reference_shell_commands=[
+            shell_wait + "\n" + shell_create_secret,
+        ],
+        reference_teardown_commands=[
+            ["delete", "secret", secret_name, "-n", namespace, "--ignore-not-found"],
+            ["delete", "certificatesigningrequests.certificates.k8s.io", csr_name, "--ignore-not-found"],
+        ],
+    )
+    r.assertions = [
+        ResourceAssertion("certificatesigningrequests.certificates.k8s.io", csr_name),
+        ResourceAssertion(
+            "certificatesigningrequests.certificates.k8s.io", csr_name, None,
+            '{.status.conditions[?(@.type=="Approved")].status}', "True",
+        ),
+        ResourceAssertion(
+            "certificatesigningrequests.certificates.k8s.io", csr_name, None,
+            "{.status.certificate}", op="nonempty",
+        ),
+        ResourceAssertion("secrets", secret_name, namespace, "{.data.tls\\.crt}", CERT_PEM_HEADER_B64, "contains"),
+        ResourceAssertion("secrets", secret_name, namespace, "{.data.tls\\.key}", PRIV_KEY_PEM_HEADER_B64, "contains"),
+    ]
+    return r
+
+
+def render_validating_admission_policy(q: QuestionSpec) -> RenderResult:
+    p = q.params
+    policy_name = p["policy_name"]
+    binding_name = p["binding_name"]
+    namespace = p["namespace"]
+    label_key = p["label_key"]
+
+    expression = f"has(object.metadata.labels) && '{label_key}' in object.metadata.labels"
+    task = (
+        f"Create a ValidatingAdmissionPolicy named `{policy_name}` that rejects any Pod CREATE or "
+        f"UPDATE in namespace `{namespace}` unless the pod carries the label `{label_key}` (any value). "
+        f"Then create a ValidatingAdmissionPolicyBinding named `{binding_name}` that binds the policy "
+        f"and applies only to namespace `{namespace}`.\n\n"
+        f"The policy must use a CEL expression equivalent to: {expression}\n"
+        f"If the rule is working, an attempt to create a pod without that label is rejected by the API server."
+    )
+
+    policy_doc = {
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "ValidatingAdmissionPolicy",
+        "metadata": {"name": policy_name},
+        "spec": {
+            "failurePolicy": "Fail",
+            "matchConstraints": {
+                "resourceRules": [
+                    {
+                        "apiGroups": [""],
+                        "apiVersions": ["v1"],
+                        "operations": ["CREATE", "UPDATE"],
+                        "resources": ["pods"],
+                    }
+                ]
+            },
+            "validations": [
+                {
+                    "expression": expression,
+                    "message": f"pod must carry the label {label_key}",
+                }
+            ],
+        },
+    }
+    binding_doc = {
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "ValidatingAdmissionPolicyBinding",
+        "metadata": {"name": binding_name},
+        "spec": {
+            "policyName": policy_name,
+            "validationActions": ["Deny"],
+            "matchResources": {
+                "namespaceSelector": {
+                    "matchLabels": {"kubernetes.io/metadata.name": namespace},
+                }
+            },
+        },
+    }
+    violating_pod_name = f"{policy_name}-probe"
+    violating_pod = {
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": violating_pod_name, "namespace": namespace},
+        "spec": {"containers": [{"name": "app", "image": "nginx:1.27"}]},
+    }
+
+    r = RenderResult(
+        archetype_id=q.archetype_id,
+        question_index=0,
+        task=task,
+        setup_manifests=[_namespace_doc(namespace)],
+        reference_manifests=[policy_doc, binding_doc],
+        reference_teardown_commands=[
+            ["delete", "validatingadmissionpolicybindings.admissionregistration.k8s.io", binding_name, "--ignore-not-found"],
+            ["delete", "validatingadmissionpolicies.admissionregistration.k8s.io", policy_name, "--ignore-not-found"],
+            ["delete", "pod", violating_pod_name, "-n", namespace, "--ignore-not-found"],
+        ],
+    )
+    r.assertions = [
+        ResourceAssertion("validatingadmissionpolicies.admissionregistration.k8s.io", policy_name),
+        ResourceAssertion(
+            "validatingadmissionpolicies.admissionregistration.k8s.io", policy_name, None,
+            "{.spec.validations[0].expression}", expression,
+        ),
+        ResourceAssertion("validatingadmissionpolicybindings.admissionregistration.k8s.io", binding_name),
+        ResourceAssertion(
+            "validatingadmissionpolicybindings.admissionregistration.k8s.io", binding_name, None,
+            "{.spec.policyName}", policy_name,
+        ),
+        ApplyFailsAssertion(
+            violating_pod,
+            description=f"pod without label {label_key} is rejected by the admission policy",
+            pre_argv=["delete", "pod", violating_pod_name, "-n", namespace, "--ignore-not-found"],
+        ),
+    ]
+    return r
+
+
+def render_jsonpath(q: QuestionSpec) -> RenderResult:
+    p = q.params
+    cm_name = p["cm_name"]
+    cm_namespace = p["cm_namespace"]
+    cm_key = p["cm_key"]
+    query = p["query"]
+
+    queries = {
+        "node_names": (
+            "{.items[*].metadata.name}",
+            "the name of every node",
+        ),
+        "node_internal_ips": (
+            '{.items[*].status.addresses[?(@.type=="InternalIP")].address}',
+            "the InternalIP address of every node",
+        ),
+        "node_os_image": (
+            "{.items[*].status.nodeInfo.osImage}",
+            "the OS image of every node",
+        ),
+    }
+    jsonpath, description = queries[query]
+    canonical_argv = ["get", "nodes", "-o", f"jsonpath={jsonpath}"]
+    rendered_query = "kubectl " + " ".join(list(canonical_argv))
+    # The reference runs the same query and stores the existing output in the ConfigMap
+    # via dry-run + apply (idempotent across preflight/solve cycles). The grader re-runs
+    # the canonical query at grade time and compares (whitespace normalized), so the value
+    # is verified against the live cluster.
+    shell_command = (
+        f'kubectl get nodes --no-headers -o jsonpath=\'{jsonpath}\' > /tmp/cka_jp.out 2>/dev/null; '
+        f"kubectl create configmap {cm_name} -n {cm_namespace} "
+        f"--from-file={cm_key}=/tmp/cka_jp.out --dry-run=client -o yaml | kubectl apply -f -"
+    )
+
+    task = (
+        f"Run the following kubectl command to extract {description}:\n\n"
+        f"    {rendered_query}\n\n"
+        f"Store the exact output in a ConfigMap named `{cm_name}` in namespace `{cm_namespace}` "
+        f"under the key `{cm_key}`:\n"
+        f"    kubectl create configmap {cm_name} -n {cm_namespace} --from-literal={cm_key}="
+        f"$(kubectl get nodes -o jsonpath='{jsonpath}')\n\n"
+        f"The grader compares the stored value against a fresh run of the same query, so capture "
+        f"the output verbatim."
+    )
+
+    r = RenderResult(
+        archetype_id=q.archetype_id,
+        question_index=0,
+        task=task,
+        setup_manifests=[_namespace_doc(cm_namespace)],
+        reference_manifests=[
+            {
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": cm_name, "namespace": cm_namespace},
+                "data": {cm_key: ""},
+            },
+        ],
+        reference_shell_commands=[shell_command],
+        reference_teardown_commands=[
+            ["delete", "configmap", cm_name, "-n", cm_namespace, "--ignore-not-found"],
+        ],
+    )
+    r.assertions = [
+        ResourceAssertion("configmaps", cm_name, cm_namespace),
+        LiveQueryMatchAssertion(
+            canonical_argv=canonical_argv,
+            stored_resource="configmaps",
+            stored_name=cm_name,
+            stored_namespace=cm_namespace,
+            stored_jsonpath=f"{{.data.{cm_key}}}",
+        ),
+    ]
+    return r
+
+
 def render_fix_deployment(q: QuestionSpec) -> RenderResult:
     p = q.params
     labels = p["labels"]
@@ -1478,6 +1754,7 @@ def render_fix_pvc(q: QuestionSpec) -> RenderResult:
         question_index=0,
         task=task,
         setup_manifests=[_namespace_doc(namespace), broken],
+        setup_waits_skip={("PersistentVolumeClaim", name)},
     )
     r.assertions = [
         ResourceAssertion("persistentvolumeclaims", name, namespace),
@@ -1578,6 +1855,7 @@ def render_fix_scheduling(q: QuestionSpec) -> RenderResult:
         question_index=0,
         task=task,
         setup_manifests=[_namespace_doc(p["namespace"]), broken],
+        setup_waits_skip={("Deployment", p["name"])},
         setup_commands=[["label", "nodes", NODE_TOKEN, f"{p['node_label_key']}={p['node_label_value']}"]],
         node_required=True,
     )
@@ -1851,6 +2129,9 @@ RENDERERS = {
     "crd": render_crd,
     "operator": render_operator,
     "gateway": render_gateway,
+    "csr": render_csr,
+    "validating_admission_policy": render_validating_admission_policy,
+    "jsonpath": render_jsonpath,
     "fix_deployment": render_fix_deployment,
     "fix_service": render_fix_service,
     "fix_pvc": render_fix_pvc,

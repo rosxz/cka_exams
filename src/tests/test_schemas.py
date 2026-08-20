@@ -436,3 +436,52 @@ def test_storage_class_must_be_unique_across_exam():
 def test_parse_json_strips_fences():
     assert parse_json('```json\n{"a": 1}\n```') == {"a": 1}
     assert parse_json('{"a": 1}') == {"a": 1}
+
+
+def test_csr_requires_required_params():
+    base = {
+        "archetype": "csr",
+        "params": {"csr_name": "user-csr", "cn": "dev", "namespace": "ns", "secret_name": "tls"},
+    }
+    assert validate_exam_payload({"questions": [base]}, REGISTRY) == []
+    for missing in ("csr_name", "cn", "namespace", "secret_name"):
+        q = {**base, "params": {k: v for k, v in base["params"].items() if k != missing}}
+        assert validate_exam_payload({"questions": [q]}, REGISTRY) != [], missing
+    bad_csr = {**base, "params": {**base["params"], "csr_name": "Bad_Name"}}
+    assert validate_exam_payload({"questions": [bad_csr]}, REGISTRY) != []
+
+
+def test_csr_names_must_be_unique_across_exam():
+    csr1 = {
+        "archetype": "csr",
+        "params": {"csr_name": "user-csr", "cn": "a", "namespace": "ns1", "secret_name": "s1"},
+    }
+    csr2 = {
+        "archetype": "csr",
+        "params": {"csr_name": "user-csr", "cn": "b", "namespace": "ns2", "secret_name": "s2"},
+    }
+    errors = validate_exam_payload({"questions": [csr1, csr2]}, REGISTRY)
+    assert any("CSR name" in e and "user-csr" in e for e in errors)
+
+    csr2 = {**csr2, "params": {**csr2["params"], "csr_name": "other-csr"}}
+    assert validate_exam_payload({"questions": [csr1, csr2]}, REGISTRY) == []
+
+
+def test_validating_admission_policy_requires_params():
+    base = {
+        "archetype": "validating_admission_policy",
+        "params": {"policy_name": "req-label", "binding_name": "req-label-bind", "namespace": "ns", "label_key": "env"},
+    }
+    assert validate_exam_payload({"questions": [base]}, REGISTRY) == []
+    bad_key = {**base, "params": {**base["params"], "label_key": "Bad Key"}}
+    assert validate_exam_payload({"questions": [bad_key]}, REGISTRY) != []
+
+
+def test_jsonpath_requires_valid_query():
+    base = {
+        "archetype": "jsonpath",
+        "params": {"cm_name": "info", "cm_namespace": "ns", "cm_key": "names", "query": "node_names"},
+    }
+    assert validate_exam_payload({"questions": [base]}, REGISTRY) == []
+    bad_query = {**base, "params": {**base["params"], "query": "not_a_real_query"}}
+    assert validate_exam_payload({"questions": [bad_query]}, REGISTRY) != []

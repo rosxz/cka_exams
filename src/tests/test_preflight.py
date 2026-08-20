@@ -199,3 +199,121 @@ def test_preflight_install_yourself_flow(fake_tooling, tmp_path):
     assert delete_calls, "teardown commands must run"
     install_calls = [c for c in fake_tooling.calls if c[:2] == ["kubectl", "apply"]]
     assert any(c[2] == "-f" and c[3] != "-" for c in install_calls), "install commands must run"
+
+
+def _admission_spec():
+    return QuestionSpec(
+        archetype_id="validating_admission_policy",
+        params={
+            "policy_name": "req-label",
+            "binding_name": "req-label-bind",
+            "namespace": "admons",
+            "label_key": "env",
+        },
+    )
+
+
+def test_preflight_admission_policy_flow(fake_tooling):
+    """VAP challenge: reference installs policy+binding; a pod without the label
+    must then be rejected per the ApplyFailsAssertion; teardown restores."""
+    state = {"policy_applied": False}
+
+    @fake_tooling.when("kubectl", "apply", "-f", "-")
+    def apply_stdin(argv):
+        manifest = (fake_tooling.last_kwargs.get("input") or "")
+        if "req-label-probe" in manifest:
+            # The violating pod: rejected once the policy exists, accepted before.
+            rc = 1 if state["policy_applied"] else 0
+            return subprocess.CompletedProcess(argv, rc, "", "denied" if rc else "")
+        if "kind: ValidatingAdmissionPolicy" in manifest:
+            state["policy_applied"] = True
+        return subprocess.CompletedProcess(argv, 0, "applied", "")
+
+    @fake_tooling.when("kubectl", "delete")
+    def delete(argv):
+        if any("validatingadmissionpolicy" in a for a in argv):
+            state["policy_applied"] = False
+        return subprocess.CompletedProcess(argv, 0, "deleted", "")
+
+    @fake_tooling.when("kubectl", "get", "validatingadmissionpolicies.admissionregistration.k8s.io")
+    def get_policy(argv):
+        if not state["policy_applied"]:
+            return subprocess.CompletedProcess(argv, 1, "", "NotFound")
+        if "-o" in argv:
+            path = argv[argv.index("-o") + 1].split("jsonpath=", 1)[1]
+            value = (
+                "has(object.metadata.labels) && 'env' in object.metadata.labels"
+                if "expression" in path else ""
+            )
+            return subprocess.CompletedProcess(argv, 0, value, "")
+        return subprocess.CompletedProcess(argv, 0, "req-label", "")
+
+    @fake_tooling.when("kubectl", "get", "validatingadmissionpolicybindings.admissionregistration.k8s.io")
+    def get_binding(argv):
+        if not state["policy_applied"]:
+            return subprocess.CompletedProcess(argv, 1, "", "NotFound")
+        if "-o" in argv:
+            path = argv[argv.index("-o") + 1].split("jsonpath=", 1)[1]
+            value = "req-label" if "policyName" in path else ""
+            return subprocess.CompletedProcess(argv, 0, value, "")
+        return subprocess.CompletedProcess(argv, 0, "req-label-bind", "")
+
+    result = RENDERERS["validating_admission_policy"](_admission_spec())
+    report = preflight_result(Kubectl(), result, node_name="minikube")
+    assert not report.warnings
+    # The reference applied the policy+binding; teardown removed them.
+    assert state["policy_applied"] is False
+    delete_calls = [c for c in fake_tooling.calls if c[:2] == ["kubectl", "delete"]]
+    assert delete_calls, "teardown commands must run"
+
+
+def test_preflight_jsonpath_flow(fake_tooling, tmp_path):
+    """JSONPath challenge: reference seeds the ConfigMap with the query output;
+    the grader compares the stored value against a live re-run of the same query."""
+    stored = {"names": ""}
+
+    @fake_tooling.when("kubectl", "apply", "-f", "-")
+    def apply_stdin(argv):
+        return subprocess.CompletedProcess(argv, 0, "applied", "")
+
+    @fake_tooling.when("sh", "-c")
+    def shell(argv):
+        # Simulate the reference shell command: seed the configmap with the output
+        # of the canonical query against the live cluster.
+        stored["names"] = "minikube"
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    @fake_tooling.when("kubectl", "create", "configmap")
+    def create_cm(argv):
+        stored["names"] = "minikube"
+        return subprocess.CompletedProcess(argv, 0, "configmap/info created", "")
+
+    @fake_tooling.when("kubectl", "get", "configmaps")
+    def get_cm(argv):
+        if "-o" in argv:
+            path = argv[argv.index("-o") + 1].split("jsonpath=", 1)[1]
+            value = stored.get("names", "") if ".data.names" in path else ""
+            return subprocess.CompletedProcess(argv, 0, value, "")
+        if "info" in argv:  # plain resource-existence query
+            return subprocess.CompletedProcess(argv, 0, "info", "")
+        return subprocess.CompletedProcess(argv, 1, "", "NotFound")
+
+    @fake_tooling.when("kubectl", "get", "nodes")
+    def get_nodes(argv):
+        return subprocess.CompletedProcess(argv, 0, "minikube", "")
+
+    @fake_tooling.when("kubectl", "delete")
+    def delete(argv):
+        if "configmap" in argv:
+            stored["names"] = ""
+        return subprocess.CompletedProcess(argv, 0, "deleted", "")
+
+    result = RENDERERS["jsonpath"](QuestionSpec("jsonpath", {
+        "cm_name": "info", "cm_namespace": "jpath", "cm_key": "names", "query": "node_names",
+    }))
+    report = preflight_result(Kubectl(), result, node_name="minikube", files_dir=tmp_path)
+    assert not report.warnings
+    # teardown removed the configmap, leaving the challenge unsolved
+    assert stored["names"] == ""
+    delete_calls = [c for c in fake_tooling.calls if c[:2] == ["kubectl", "delete"]]
+    assert delete_calls, "teardown commands must run"
